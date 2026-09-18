@@ -4,7 +4,7 @@
 #import <AudioToolbox/AudioToolbox.h>
 #import <substrate.h>
 
-// 私有类 NSTask 声明（iOS 平台不公开，需要手动声明才能编译）
+// 私有类 NSTask 声明
 @interface NSTask : NSObject
 @property (nonatomic, retain) NSString *launchPath;
 @property (nonatomic, retain) NSArray *arguments;
