@@ -1,1 +1,33 @@
-1
+name: Build Tweak
+
+on:
+  push:
+    branches: [ master, main ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Theos
+        run: |
+          brew install ldid dpkg
+          export THEOS=$HOME/theos
+          git clone --recursive https://github.com/theos/theos.git $THEOS
+          echo "THEOS=$THEOS" >> $GITHUB_ENV
+          echo "$THEOS/bin" >> $GITHUB_PATH
+
+      - name: Build package
+        run: |
+          make package THEOS_DEVICE_IP=127.0.0.1
+
+      - name: Upload deb
+        uses: actions/upload-artifact@v4
+        with:
+          name: vcam-deb
+          path: packages/*.deb
