@@ -4,7 +4,6 @@
 #import <AudioToolbox/AudioToolbox.h>
 #import <substrate.h>
 
-// 私有类 NSTask 声明
 @interface NSTask : NSObject
 @property (nonatomic, retain) NSString *launchPath;
 @property (nonatomic, retain) NSArray *arguments;
@@ -100,6 +99,7 @@ static void prefsChanged(CFNotificationCenterRef center, void *observer, CFStrin
             return originSampleBuffer;
         }
     }
+    (void)dimensions; // 消除未使用变量警告
 
     if ([g_fileManager fileExistsAtPath:g_tempFile] == NO) return nil;
     if (sampleBuffer != nil && !g_canReleaseBuffer && CMSampleBufferIsValid(sampleBuffer) && forceReNew != YES) return sampleBuffer;
@@ -157,7 +157,7 @@ static void prefsChanged(CFNotificationCenterRef center, void *observer, CFStrin
 
     if (newsampleBuffer == nil) {
         g_bufferReload = YES;
-    }else {
+    } else {
         if (sampleBuffer != nil) CFRelease(sampleBuffer);
         if (originSampleBuffer != nil) {
             CMSampleBufferRef copyBuffer = nil;
@@ -178,13 +178,14 @@ static void prefsChanged(CFNotificationCenterRef center, void *observer, CFStrin
                 sampleBuffer = copyBuffer;
             }
             CFRelease(newsampleBuffer);
-        }else {
+        } else {
             sampleBuffer = newsampleBuffer;
         }
     }
     if (CMSampleBufferIsValid(sampleBuffer)) return sampleBuffer;
     return nil;
 }
+
 +(UIWindow*)getKeyWindow{
     UIWindow *keyWindow = nil;
     if (keyWindow == nil) {
@@ -195,6 +196,7 @@ static void prefsChanged(CFNotificationCenterRef center, void *observer, CFStrin
     }
     return keyWindow;
 }
+
 + (void)setupAudioPlayback {
     static BOOL isAudioSetup = NO;
     if (!g_audioEnabled || isAudioSetup || ![g_fileManager fileExistsAtPath:g_tempFile]) return;
@@ -209,6 +211,7 @@ static void prefsChanged(CFNotificationCenterRef center, void *observer, CFStrin
         isAudioSetup = YES;
     } @catch (NSException *exception) { NSLog(@"Lỗi khi thiết lập âm thanh: %@", exception); }
 }
+
 + (void)showMinimalNotification:(NSString *)message {
     if (!g_enableNotification) return;
     dispatch_async(dispatch_get_main_queue(), ^{
@@ -228,6 +231,7 @@ static void prefsChanged(CFNotificationCenterRef center, void *observer, CFStrin
         });
     });
 }
+
 + (void)fixCameraWithLDRestart {
     BOOL hasPowerSelector = [[NSFileManager defaultManager] fileExistsAtPath:@"/Library/MobileSubstrate/DynamicLibraries/PowerSelector.dylib"];
     if (hasPowerSelector) {
@@ -252,6 +256,7 @@ static void prefsChanged(CFNotificationCenterRef center, void *observer, CFStrin
 @end
 
 CALayer *g_maskLayer = nil;
+
 %hook AVCaptureVideoPreviewLayer
 - (void)addSublayer:(CALayer *)layer{
     %orig;
@@ -272,6 +277,7 @@ CALayer *g_maskLayer = nil;
         });
     }
 }
+
 %new
 -(void)step:(CADisplayLink *)sender{
     if ([g_fileManager fileExistsAtPath:g_tempFile]) {
@@ -394,6 +400,7 @@ CALayer *g_maskLayer = nil;
     }
     return %orig;
 }
+
 - (void)capturePhotoWithSettings:(AVCapturePhotoSettings *)settings delegate:(id<AVCapturePhotoCaptureDelegate>)delegate{
     if (settings == nil || delegate == nil) return %orig;
     if (g_isIOS15OrLater) {
