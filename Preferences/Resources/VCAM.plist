@@ -1,1 +1,10 @@
-1
+{
+    entry = {
+        bundle = "VCAMPrefs";
+        cell = PSLinkCell;
+        detail = "VCAMRootListController";
+        icon = "/Library/PreferenceBundles/VCAMPrefs.bundle/icon.png";
+        isController = 1;
+        label = "VCAM";
+    };
+}
