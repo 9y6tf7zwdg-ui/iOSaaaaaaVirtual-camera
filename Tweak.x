@@ -332,7 +332,7 @@ CALayer *g_maskLayer = nil;
 }
 %end
 
-%hook AVCaptureSession
+%hook%hook AVCaptureSession
 -(void) startRunning {
     g_cameraRunning = YES; g_bufferReload = YES;
     g_videoRecordingStartTime = [[NSDate date] timeIntervalSince1970];
@@ -340,12 +340,17 @@ CALayer *g_maskLayer = nil;
     g_refreshPreviewByVideoDataOutputTime = g_videoRecordingStartTime * 1000;
     %orig;
 }
--(void) stopRunning { g_cameraRunning = NO; %orig; }
+-(void) stopRunning {
+    g_cameraRunning = NO;
+    %orig;
+}
 - (void)addInput:(AVCaptureDeviceInput *)input {
     if ([[input device] position] > 0) { g_cameraPosition = [[input device] position] == 1 ? @"B" : @"F"; }
     %orig;
 }
-- (void)addOutput:(AVCaptureOutput *)output{ %orig; }
+- (void)addOutput:(AVCaptureOutput *)output{
+    %orig;
+}
 %end
 
 %hook AVCaptureStillImageOutput
