@@ -19,9 +19,9 @@ static AVAssetReaderTrackOutput *videoTrackout_32BGRA = nil;
 static AVAssetReaderTrackOutput *videoTrackout_420YpCbCr8BiPlanarVideoRange = nil;
 static AVAssetReaderTrackOutput *videoTrackout_420YpCbCr8BiPlanarFullRange = nil;
 
-// 视频方向校正
-static CGAffineTransform g_videoPreferredTransform = CGAffineTransformIdentity;
-static CGSize g_videoNaturalSize = CGSizeZero;
+// 视频方向校正（不在声明时初始化，因为 CGAffineTransformIdentity / CGSizeZero 不是编译期常量）
+static CGAffineTransform g_videoPreferredTransform;
+static CGSize g_videoNaturalSize;
 static CIContext *g_ciContext = nil;
 
 static NSTimeInterval g_lastBufferRefreshTime = 0;
@@ -69,7 +69,6 @@ NSString *g_tempFile = nil;
             reader = [AVAssetReader assetReaderWithAsset:asset error:nil];
             AVAssetTrack *videoTrack = [[asset tracksWithMediaType:AVMediaTypeVideo] firstObject];
 
-            // 保存视频轨道的方向信息
             g_videoPreferredTransform = videoTrack.preferredTransform;
             g_videoNaturalSize = videoTrack.naturalSize;
 
@@ -112,7 +111,6 @@ NSString *g_tempFile = nil;
     } else {
         if (sampleBuffer) CFRelease(sampleBuffer);
 
-        // 应用方向校正
         CMSampleBufferRef orientedBuffer = [self applyOrientation:newsampleBuffer];
 
         if (originSampleBuffer != nil) {
@@ -144,9 +142,7 @@ NSString *g_tempFile = nil;
     return nil;
 }
 
-// 应用视频方向校正
 + (CMSampleBufferRef)applyOrientation:(CMSampleBufferRef)originalBuffer {
-    // 如果方向是默认的，直接返回
     if (CGAffineTransformIsIdentity(g_videoPreferredTransform)) {
         CFRetain(originalBuffer);
         return originalBuffer;
@@ -185,17 +181,15 @@ NSString *g_tempFile = nil;
         return originalBuffer;
     }
 
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
+    if (g_ciContext == nil) {
         g_ciContext = [CIContext contextWithOptions:@{kCIContextUseSoftwareRenderer: @NO}];
-    });
+    }
 
     [g_ciContext render:transformedImage
         toCVPixelBuffer:newPixelBuffer
                  bounds:extent
              colorSpace:NULL];
 
-    // 创建新的 CMSampleBuffer
     CMSampleTimingInfo timing = {0};
     CMSampleBufferGetSampleTimingInfo(originalBuffer, 0, &timing);
 
@@ -257,7 +251,6 @@ CALayer *g_maskLayer = nil;
         if (g_maskLayer) g_maskLayer.opacity = 1;
         if (g_previewLayer) {
             g_previewLayer.opacity = 1;
-            // 使用 AspectFill 避免视频拉伸变形
             [g_previewLayer setVideoGravity:AVLayerVideoGravityResizeAspectFill];
         }
     } else {
@@ -508,13 +501,15 @@ CALayer *g_maskLayer = nil;
 %end
 
 %ctor {
+    g_videoPreferredTransform = CGAffineTransformIdentity;
+    g_videoNaturalSize = CGSizeZero;
+
     g_isMirroredMark = [NSString stringWithUTF8String:jbroot("/var/mobile/Library/Caches/vcam_is_mirrored_mark")];
     g_tempFile = [NSString stringWithUTF8String:jbroot("/var/mobile/Library/Caches/temp.mov")];
 
     if ([[NSProcessInfo processInfo] isOperatingSystemAtLeastVersion:(NSOperatingSystemVersion){15, 0, 0}]) g_isIOS15OrLater = YES;
     g_fileManager = [NSFileManager defaultManager];
 
-    // 创建 CIContext（用于视频方向校正）
     g_ciContext = [CIContext contextWithOptions:@{kCIContextUseSoftwareRenderer: @NO}];
 }
 
