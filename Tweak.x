@@ -4,6 +4,7 @@
 #import <AudioToolbox/AudioToolbox.h>
 #include <roothide.h>
 #import <substrate.h>
+#import "VCAMSystemCamera.h"   // ⭐ 新增
 
 static NSFileManager *g_fileManager = nil;
 static BOOL g_canReleaseBuffer = YES;
@@ -13,6 +14,9 @@ static NSTimeInterval g_refreshPreviewByVideoDataOutputTime = 0;
 static BOOL g_cameraRunning = NO;
 static NSString *g_cameraPosition = @"B";
 static AVCaptureVideoOrientation g_photoOrientation = AVCaptureVideoOrientationPortrait;
+
+// ⭐ 改动 1：去掉 static，让 VCAMSystemCamera.x 也能读到
+BOOL g_systemCameraMode = NO;
 
 static AVAssetReader *reader = nil;
 static AVAssetReaderTrackOutput *videoTrackout_32BGRA = nil;
@@ -25,6 +29,32 @@ static BOOL g_isIOS15OrLater = NO;
 
 NSString *g_isMirroredMark = nil;
 NSString *g_tempFile = nil;
+
+static NSDictionary *preferences;
+
+static void loadPreferences() {
+    CFArrayRef keyList = CFPreferencesCopyKeyList(CFSTR("com.trizau.sileo.vcam"), kCFPreferencesCurrentUser, kCFPreferencesAnyHost);
+    if (keyList) {
+        preferences = (__bridge NSDictionary *)CFPreferencesCopyMultiple(keyList, CFSTR("com.trizau.sileo.vcam"), kCFPreferencesCurrentUser, kCFPreferencesAnyHost);
+        CFRelease(keyList);
+    }
+}
+
+static BOOL getBoolFromPreferences(NSString *key, BOOL defaultValue) {
+    if (preferences && [preferences objectForKey:key]) {
+        return [[preferences objectForKey:key] boolValue];
+    }
+    return defaultValue;
+}
+
+static void updatePreferences() {
+    loadPreferences();
+    g_systemCameraMode = getBoolFromPreferences(@"systemCameraMode", NO);   // ⭐ 新增
+}
+
+static void prefsChanged(CFNotificationCenterRef center, void *observer, CFStringRef name, const void *object, CFDictionaryRef userInfo) {
+    updatePreferences();
+}
 
 @interface GetFrame : NSObject
 + (CMSampleBufferRef _Nullable)getCurrentFrame:(CMSampleBufferRef)originSampleBuffer :(BOOL)forceReNew;
@@ -144,25 +174,33 @@ NSString *g_tempFile = nil;
 
 CALayer *g_maskLayer = nil;
 
+// ⭐ 改动 2：去掉 static，让 VCAMSystemCamera.x 能调用
+void VCAMSetupPreviewLayer(AVCaptureVideoPreviewLayer *layer) {
+    if (!layer) return;
+    if ([[layer sublayers] containsObject:g_previewLayer]) return;
+
+    g_previewLayer = [[AVSampleBufferDisplayLayer alloc] init];
+    g_maskLayer = [CALayer new];
+    g_maskLayer.backgroundColor = [UIColor blackColor].CGColor;
+    [layer insertSublayer:g_maskLayer above:layer.sublayers.lastObject];
+    [layer insertSublayer:g_previewLayer above:g_maskLayer];
+
+    dispatch_async(dispatch_get_main_queue(), ^{
+        g_previewLayer.frame = layer.bounds;
+        g_maskLayer.frame = layer.bounds;
+    });
+
+    static CADisplayLink *displayLink = nil;
+    if (displayLink == nil) {
+        displayLink = [CADisplayLink displayLinkWithTarget:layer selector:@selector(step:)];
+        [displayLink addToRunLoop:[NSRunLoop currentRunLoop] forMode:NSRunLoopCommonModes];
+    }
+}
+
 %hook AVCaptureVideoPreviewLayer
 - (void)addSublayer:(CALayer *)layer {
     %orig;
-    static CADisplayLink *displayLink = nil;
-    if (displayLink == nil) {
-        displayLink = [CADisplayLink displayLinkWithTarget:self selector:@selector(step:)];
-        [displayLink addToRunLoop:[NSRunLoop currentRunLoop] forMode:NSRunLoopCommonModes];
-    }
-    if (![[self sublayers] containsObject:g_previewLayer]) {
-        g_previewLayer = [[AVSampleBufferDisplayLayer alloc] init];
-        g_maskLayer = [CALayer new];
-        g_maskLayer.backgroundColor = [UIColor blackColor].CGColor;
-        [self insertSublayer:g_maskLayer above:layer];
-        [self insertSublayer:g_previewLayer above:g_maskLayer];
-        dispatch_async(dispatch_get_main_queue(), ^{
-            g_previewLayer.frame = [UIApplication sharedApplication].keyWindow.bounds;
-            g_maskLayer.frame = [UIApplication sharedApplication].keyWindow.bounds;
-        });
-    }
+    VCAMSetupPreviewLayer(self);
 }
 
 %new
@@ -177,9 +215,10 @@ CALayer *g_maskLayer = nil;
         if (g_maskLayer) g_maskLayer.opacity = 0;
         if (g_previewLayer) g_previewLayer.opacity = 0;
     }
-    if (g_cameraRunning && g_previewLayer) {
+
+    // ⭐ 改动 3：加上 g_systemCameraMode 判断，系统相机模式下也持续渲染
+    if ((g_cameraRunning || g_systemCameraMode) && g_previewLayer) {
         g_previewLayer.frame = self.bounds;
-        // ⭐ 不做任何旋转，视频以自身方向直接显示
         g_previewLayer.transform = CATransform3DIdentity;
 
         static NSTimeInterval refreshTime = 0;
@@ -257,7 +296,7 @@ CALayer *g_maskLayer = nil;
     CMSampleBufferRef newBuffer = [GetFrame getCurrentFrame:nil :NO];
     if (newBuffer) {
         CVImageBufferRef pixelBuffer = CMSampleBufferGetImageBuffer(newBuffer);
-        CIImage *ciimage = [CIImage imageWithCVImageBuffer:pixelBuffer];
+        CIImage *ciimage = [CIImage imageWithCIImage:pixelBuffer];
         UIImage *uiimage = [UIImage imageWithCIImage:ciimage scale:2.0f orientation:UIImageOrientationUp];
         return UIImageJPEGRepresentation(uiimage, 1);
     }
@@ -361,6 +400,10 @@ CALayer *g_maskLayer = nil;
 
     if ([[NSProcessInfo processInfo] isOperatingSystemAtLeastVersion:(NSOperatingSystemVersion){15, 0, 0}]) g_isIOS15OrLater = YES;
     g_fileManager = [NSFileManager defaultManager];
+
+    updatePreferences();
+
+    CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), NULL, prefsChanged, CFSTR("com.trizau.sileo.vcam.prefschanged"), NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
 }
 
 %dtor {
