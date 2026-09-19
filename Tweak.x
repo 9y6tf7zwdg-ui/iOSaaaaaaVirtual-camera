@@ -6,7 +6,6 @@
 #import <substrate.h>
 #import "VCAMDebugLog.h"
 
-// ========== 全局变量 ==========
 static NSFileManager *g_fileManager = nil;
 static BOOL g_canReleaseBuffer = YES;
 static BOOL g_bufferReload = YES;
@@ -18,14 +17,16 @@ static NSString *g_cameraPosition = @"B";
 static AVCaptureVideoOrientation g_photoOrientation = AVCaptureVideoOrientationPortrait;
 static BOOL g_isIOS15OrLater = NO;
 
+// ========== 后台解码缓存 ==========
 static AVAssetReader *reader = nil;
 static AVAssetReaderTrackOutput *videoTrackout_32BGRA = nil;
-static AVAssetReaderTrackOutput *videoTrackout_420YpCbCr8BiPlanarVideoRange = nil;
-static AVAssetReaderTrackOutput *videoTrackout_420YpCbCr8BiPlanarFullRange = nil;
+static CMSampleBufferRef g_cachedFrame = nil;
+static NSLock *g_frameLock = nil;
+static dispatch_queue_t g_decodeQueue = nil;
+static volatile BOOL g_decoderRunning = NO;
 
 static NSTimeInterval g_lastBufferRefreshTime = 0;
 static const NSTimeInterval BUFFER_REFRESH_INTERVAL = 30.0;
-static dispatch_queue_t g_videoReadQueue = nil;
 
 NSString *g_tempFile = nil;
 NSString *g_isMirroredMark = nil;
@@ -49,25 +50,84 @@ static void prefsChanged(CFNotificationCenterRef center, void *observer, CFStrin
     updatePreferences();
 }
 
-// ========== 看门狗定时器 ==========
-static NSTimer *g_watchdogTimer = nil;
+// ========== 后台解码线程 ==========
+static BOOL VCAMInitReader(void) {
+    @try {
+        if (reader) { [reader cancelReading]; reader = nil; }
+        if (videoTrackout_32BGRA) { videoTrackout_32BGRA = nil; }
 
-static void VCAMStartWatchdog(void) {
-    if (g_watchdogTimer) return;
-    dispatch_async(dispatch_get_main_queue(), ^{
-        g_watchdogTimer = [NSTimer scheduledTimerWithTimeInterval:2.0 repeats:YES block:^(NSTimer *timer) {
-            if (g_cameraRunning && g_previewLayer) {
-                NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
-                if (now - g_lastBufferRefreshTime > 5.0) {
-                    VCAM_LOG(@"看门狗触发：长时间无更新，强制刷新");
-                    g_bufferReload = YES;
-                }
+        AVAsset *asset = [AVAsset assetWithURL:[NSURL URLWithString:[NSString stringWithFormat:@"file://%@", g_tempFile]]];
+        reader = [AVAssetReader assetReaderWithAsset:asset error:nil];
+        AVAssetTrack *videoTrack = [[asset tracksWithMediaType:AVMediaTypeVideo] firstObject];
+        if (!videoTrack) return NO;
+
+        videoTrackout_32BGRA = [[AVAssetReaderTrackOutput alloc] initWithTrack:videoTrack outputSettings:@{(id)kCVPixelBufferPixelFormatTypeKey:@(kCVPixelFormatType_32BGRA)}];
+        videoTrackout_32BGRA.alwaysCopiesSampleData = NO;
+        if (![reader canAddOutput:videoTrackout_32BGRA]) return NO;
+        [reader addOutput:videoTrackout_32BGRA];
+        [reader startReading];
+        return YES;
+    } @catch (NSException *e) {
+        VCAM_LOG(@"VCAMInitReader 失败: %@", e);
+        return NO;
+    }
+}
+
+static void VCAMDecoderLoop(void) {
+    VCAM_LOG(@"解码线程启动");
+    while (g_decoderRunning) {
+        @autoreleasepool {
+            if (reader == nil || videoTrackout_32BGRA == nil || !g_fileManager || ![g_fileManager fileExistsAtPath:g_tempFile]) {
+                usleep(50000);
+                continue;
             }
-        }];
+
+            CMSampleBufferRef newFrame = nil;
+            @try {
+                newFrame = [videoTrackout_32BGRA copyNextSampleBuffer];
+            } @catch (NSException *e) {
+                newFrame = nil;
+            }
+
+            if (newFrame == nil) {
+                // 视频结束，重新开始
+                [g_frameLock lock];
+                if (g_cachedFrame) { CFRelease(g_cachedFrame); g_cachedFrame = nil; }
+                [g_frameLock unlock];
+
+                // 重新初始化 reader
+                VCAMInitReader();
+                usleep(50000);
+                continue;
+            }
+
+            // 更新缓存
+            [g_frameLock lock];
+            if (g_cachedFrame) CFRelease(g_cachedFrame);
+            g_cachedFrame = newFrame;
+            g_lastBufferRefreshTime = [[NSDate date] timeIntervalSince1970];
+            [g_frameLock unlock];
+
+            // 约 30fps
+            usleep(33000);
+        }
+    }
+    VCAM_LOG(@"解码线程退出");
+}
+
+static void VCAMStartDecoder(void) {
+    if (g_decoderRunning) return;
+    g_decoderRunning = YES;
+    dispatch_async(g_decodeQueue, ^{
+        VCAMDecoderLoop();
     });
 }
 
-// ========== GetFrame 类 ==========
+static void VCAMStopDecoder(void) {
+    g_decoderRunning = NO;
+}
+
+// ========== GetFrame 类（只读缓存，不解码） ==========
 @interface GetFrame : NSObject
 + (CMSampleBufferRef)getCurrentFrame:(CMSampleBufferRef)originSampleBuffer :(BOOL)forceReNew;
 + (UIWindow *)getKeyWindow;
@@ -76,112 +136,56 @@ static void VCAMStartWatchdog(void) {
 @implementation GetFrame
 
 + (CMSampleBufferRef)getCurrentFrame:(CMSampleBufferRef)originSampleBuffer :(BOOL)forceReNew {
-    static CMSampleBufferRef sampleBuffer = nil;
-    CMFormatDescriptionRef formatDescription = nil;
-    CMMediaType mediaType = -1;
-    CMMediaType subMediaType = -1;
-
     if (originSampleBuffer != nil) {
-        formatDescription = CMSampleBufferGetFormatDescription(originSampleBuffer);
-        mediaType = CMFormatDescriptionGetMediaType(formatDescription);
-        subMediaType = CMFormatDescriptionGetMediaSubType(formatDescription);
-        if (mediaType != kCMMediaType_Video) return originSampleBuffer;
+        CMFormatDescriptionRef fd = CMSampleBufferGetFormatDescription(originSampleBuffer);
+        CMMediaType mt = CMFormatDescriptionGetMediaType(fd);
+        if (mt != kCMMediaType_Video) return originSampleBuffer;
     }
 
-    if ([g_fileManager fileExistsAtPath:g_tempFile] == NO) return nil;
-    if (sampleBuffer != nil && !g_canReleaseBuffer && CMSampleBufferIsValid(sampleBuffer) && forceReNew != YES) return sampleBuffer;
+    if (!g_fileManager || [g_fileManager fileExistsAtPath:g_tempFile] == NO) return nil;
 
-    static NSTimeInterval renewTime = 0;
-    if ([g_fileManager fileExistsAtPath:[NSString stringWithFormat:@"%@.new", g_tempFile]]) {
-        NSTimeInterval nowTime = [[NSDate date] timeIntervalSince1970];
-        if (nowTime - renewTime > 3) {
-            renewTime = nowTime;
-            g_bufferReload = YES;
-        }
+    // 从缓存取一帧（极快，不加锁时间过长）
+    CMSampleBufferRef cached = nil;
+    [g_frameLock lock];
+    if (g_cachedFrame) {
+        cached = (CMSampleBufferRef)CFRetain(g_cachedFrame);
+    }
+    [g_frameLock unlock];
+
+    if (!cached) return nil;
+
+    // 如果原 buffer 为 nil（预览场景），直接返回缓存的
+    if (originSampleBuffer == nil) {
+        return cached;
     }
 
-    if (g_bufferReload) {
-        g_bufferReload = NO;
-        @try {
-            AVAsset *asset = [AVAsset assetWithURL:[NSURL URLWithString:[NSString stringWithFormat:@"file://%@", g_tempFile]]];
-            reader = [AVAssetReader assetReaderWithAsset:asset error:nil];
-            AVAssetTrack *videoTrack = [[asset tracksWithMediaType:AVMediaTypeVideo] firstObject];
-            if (!videoTrack) return nil;
-
-            videoTrackout_32BGRA = [[AVAssetReaderTrackOutput alloc] initWithTrack:videoTrack outputSettings:@{(id)kCVPixelBufferPixelFormatTypeKey:@(kCVPixelFormatType_32BGRA)}];
-            videoTrackout_420YpCbCr8BiPlanarVideoRange = [[AVAssetReaderTrackOutput alloc] initWithTrack:videoTrack outputSettings:@{(id)kCVPixelBufferPixelFormatTypeKey:@(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange)}];
-            videoTrackout_420YpCbCr8BiPlanarFullRange = [[AVAssetReaderTrackOutput alloc] initWithTrack:videoTrack outputSettings:@{(id)kCVPixelBufferPixelFormatTypeKey:@(kCVPixelFormatType_420YpCbCr8BiPlanarFullRange)}];
-            [reader addOutput:videoTrackout_32BGRA];
-            [reader addOutput:videoTrackout_420YpCbCr8BiPlanarVideoRange];
-            [reader addOutput:videoTrackout_420YpCbCr8BiPlanarFullRange];
-            [reader startReading];
-        } @catch (NSException *except) {
-            VCAM_LOG(@"初始化读取视频出错: %@", except);
-        }
+    // 拍照场景：用原 buffer 的时间戳重新构造
+    CMSampleBufferRef copyBuffer = nil;
+    CVImageBufferRef pixelBuffer = CMSampleBufferGetImageBuffer(cached);
+    if (!pixelBuffer) {
+        CFRelease(cached);
+        return originSampleBuffer;
     }
 
-    __block CMSampleBufferRef buf32 = nil;
-    __block CMSampleBufferRef bufVR = nil;
-    __block CMSampleBufferRef bufFR = nil;
+    CMSampleTimingInfo sampleTime = {
+        .duration = CMSampleBufferGetDuration(originSampleBuffer),
+        .presentationTimeStamp = CMSampleBufferGetPresentationTimeStamp(originSampleBuffer),
+        .decodeTimeStamp = CMSampleBufferGetDecodeTimeStamp(originSampleBuffer)
+    };
+    CMVideoFormatDescriptionRef videoInfo = nil;
+    CMVideoFormatDescriptionCreateForImageBuffer(kCFAllocatorDefault, pixelBuffer, &videoInfo);
+    CMSampleBufferCreateForImageBuffer(kCFAllocatorDefault, pixelBuffer, true, nil, nil, videoInfo, &sampleTime, &copyBuffer);
+    if (videoInfo) CFRelease(videoInfo);
 
-    dispatch_sync(g_videoReadQueue, ^{
-        buf32 = [videoTrackout_32BGRA copyNextSampleBuffer];
-        bufVR = [videoTrackout_420YpCbCr8BiPlanarVideoRange copyNextSampleBuffer];
-        bufFR = [videoTrackout_420YpCbCr8BiPlanarFullRange copyNextSampleBuffer];
-    });
-
-    CMSampleBufferRef newSample = nil;
-    switch (subMediaType) {
-        case kCVPixelFormatType_32BGRA:
-            CMSampleBufferCreateCopy(kCFAllocatorDefault, buf32, &newSample);
-            break;
-        case kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange:
-            CMSampleBufferCreateCopy(kCFAllocatorDefault, bufVR, &newSample);
-            break;
-        case kCVPixelFormatType_420YpCbCr8BiPlanarFullRange:
-            CMSampleBufferCreateCopy(kCFAllocatorDefault, bufFR, &newSample);
-            break;
-        default:
-            CMSampleBufferCreateCopy(kCFAllocatorDefault, buf32, &newSample);
-            break;
-    }
-    if (buf32) CFRelease(buf32);
-    if (bufVR) CFRelease(bufVR);
-    if (bufFR) CFRelease(bufFR);
-
-    if (newSample == nil) {
-        g_bufferReload = YES;
-    } else {
-        if (sampleBuffer) CFRelease(sampleBuffer);
-
-        if (originSampleBuffer != nil) {
-            CMSampleBufferRef copyBuffer = nil;
-            CVImageBufferRef pixelBuffer = CMSampleBufferGetImageBuffer(newSample);
-            CMSampleTimingInfo sampleTime = {
-                .duration = CMSampleBufferGetDuration(originSampleBuffer),
-                .presentationTimeStamp = CMSampleBufferGetPresentationTimeStamp(originSampleBuffer),
-                .decodeTimeStamp = CMSampleBufferGetDecodeTimeStamp(originSampleBuffer)
-            };
-            CMVideoFormatDescriptionRef videoInfo = nil;
-            CMVideoFormatDescriptionCreateForImageBuffer(kCFAllocatorDefault, pixelBuffer, &videoInfo);
-            CMSampleBufferCreateForImageBuffer(kCFAllocatorDefault, pixelBuffer, true, nil, nil, videoInfo, &sampleTime, &copyBuffer);
-            if (videoInfo) CFRelease(videoInfo);
-
-            if (copyBuffer) {
-                CFDictionaryRef exifAttachments = CMGetAttachment(originSampleBuffer, (CFStringRef)@"{Exif}", NULL);
-                CFDictionaryRef TIFFAttachments = CMGetAttachment(originSampleBuffer, (CFStringRef)@"{TIFF}", NULL);
-                if (exifAttachments) CMSetAttachment(copyBuffer, (CFStringRef)@"{Exif}", exifAttachments, kCMAttachmentMode_ShouldPropagate);
-                if (exifAttachments) CMSetAttachment(copyBuffer, (CFStringRef)@"{TIFF}", TIFFAttachments, kCMAttachmentMode_ShouldPropagate);
-                sampleBuffer = copyBuffer;
-            }
-            CFRelease(newSample);
-        } else {
-            sampleBuffer = newSample;
-        }
+    if (copyBuffer) {
+        CFDictionaryRef exif = CMGetAttachment(originSampleBuffer, (CFStringRef)@"{Exif}", NULL);
+        CFDictionaryRef tiff = CMGetAttachment(originSampleBuffer, (CFStringRef)@"{TIFF}", NULL);
+        if (exif) CMSetAttachment(copyBuffer, (CFStringRef)@"{Exif}", exif, kCMAttachmentMode_ShouldPropagate);
+        if (tiff) CMSetAttachment(copyBuffer, (CFStringRef)@"{TIFF}", tiff, kCMAttachmentMode_ShouldPropagate);
     }
 
-    if (sampleBuffer && CMSampleBufferIsValid(sampleBuffer)) return sampleBuffer;
-    return nil;
+    CFRelease(cached);
+    return copyBuffer ? copyBuffer : originSampleBuffer;
 }
 
 + (UIWindow *)getKeyWindow {
@@ -239,12 +243,6 @@ static void VCAMStartWatchdog(void) {
             }
         }
     }
-
-    NSTimeInterval currentTime = [[NSDate date] timeIntervalSince1970];
-    if (currentTime - g_lastBufferRefreshTime > BUFFER_REFRESH_INTERVAL) {
-        g_lastBufferRefreshTime = currentTime;
-        g_bufferReload = YES;
-    }
 }
 
 @end
@@ -295,9 +293,7 @@ static void VCAMSetupPreviewLayer(AVCaptureVideoPreviewLayer *layer) {
 - (void)startRunning {
     g_cameraRunning = YES;
     g_bufferReload = YES;
-    g_lastBufferRefreshTime = [[NSDate date] timeIntervalSince1970];
-    g_refreshPreviewByVideoDataOutputTime = g_lastBufferRefreshTime * 1000;
-    VCAMStartWatchdog();
+    VCAMStartDecoder();
     %orig;
 }
 
@@ -460,6 +456,7 @@ static void VCAMSetupPreviewLayer(AVCaptureVideoPreviewLayer *layer) {
                         @selector(captureOutput:didOutputSampleBuffer:fromConnection:),
                         imp_implementationWithBlock(^(id self, AVCaptureOutput *output, CMSampleBufferRef sampleBuffer, AVCaptureConnection *connection) {
             g_refreshPreviewByVideoDataOutputTime = ([[NSDate date] timeIntervalSince1970]) * 1000;
+            // ⭐ 只从缓存取，不解码
             CMSampleBufferRef newBuffer = [GetFrame getCurrentFrame:sampleBuffer :NO];
             g_photoOrientation = [connection videoOrientation];
             if (newBuffer && g_previewLayer && g_previewLayer.readyForMoreMediaData) {
@@ -485,9 +482,13 @@ static void VCAMSetupPreviewLayer(AVCaptureVideoPreviewLayer *layer) {
         g_isIOS15OrLater = YES;
     }
     g_fileManager = [NSFileManager defaultManager];
-    g_videoReadQueue = dispatch_queue_create("com.vcam.videoRead", DISPATCH_QUEUE_SERIAL);
+    g_frameLock = [[NSLock alloc] init];
+    g_decodeQueue = dispatch_queue_create("com.vcam.decodeQueue", DISPATCH_QUEUE_SERIAL);
 
     updatePreferences();
+
+    // 首次初始化 reader
+    VCAMInitReader();
 
     CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(),
                                     NULL,
@@ -498,6 +499,10 @@ static void VCAMSetupPreviewLayer(AVCaptureVideoPreviewLayer *layer) {
 }
 
 %dtor {
+    VCAMStopDecoder();
+    [g_frameLock lock];
+    if (g_cachedFrame) { CFRelease(g_cachedFrame); g_cachedFrame = nil; }
+    [g_frameLock unlock];
     g_previewLayer = nil;
     g_maskLayer = nil;
     g_fileManager = nil;
@@ -505,5 +510,4 @@ static void VCAMSetupPreviewLayer(AVCaptureVideoPreviewLayer *layer) {
     g_bufferReload = YES;
     g_refreshPreviewByVideoDataOutputTime = 0;
     g_cameraRunning = NO;
-    g_watchdogTimer = nil;
 }
