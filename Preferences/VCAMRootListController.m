@@ -5,7 +5,6 @@
 #import <PhotosUI/PhotosUI.h>
 #import <AVFoundation/AVFoundation.h>
 #include <roothide.h>
-#import "VCAMDebugLogController.h"
 
 @interface NSTask : NSObject
 @property (nonatomic, retain) NSString *launchPath;
@@ -186,7 +185,7 @@
     [editor dismissViewControllerAnimated:YES completion:nil];
 }
 
-#pragma mark - 保存视频（导出时把方向烘焙进像素数据）
+#pragma mark - 保存视频（让系统自动应用方向）
 
 - (void)finalizeVideoWithPath:(NSString *)sourcePath {
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
@@ -198,30 +197,6 @@
             return;
         }
 
-        CGAffineTransform transform = videoTrack.preferredTransform;
-        CGSize naturalSize = videoTrack.naturalSize;
-
-        // ⭐ 用矩阵系数计算旋转后的正确渲染尺寸
-        CGFloat width = fabs(naturalSize.width * transform.a) + fabs(naturalSize.height * transform.c);
-        CGFloat height = fabs(naturalSize.width * transform.b) + fabs(naturalSize.height * transform.d);
-        CGSize renderSize = CGSizeMake(width, height);
-
-        NSLog(@"[VCAM] 视频原始尺寸 %.0fx%.0f，变换后渲染尺寸 %.0fx%.0f",
-              naturalSize.width, naturalSize.height, renderSize.width, renderSize.height);
-
-        AVMutableVideoComposition *videoComposition = [AVMutableVideoComposition videoComposition];
-        videoComposition.renderSize = renderSize;
-        videoComposition.frameDuration = CMTimeMake(1, 30);
-
-        AVMutableVideoCompositionInstruction *instruction = [AVMutableVideoCompositionInstruction videoCompositionInstruction];
-        instruction.timeRange = CMTimeRangeMake(kCMTimeZero, asset.duration);
-
-        AVMutableVideoCompositionLayerInstruction *layerInstruction = [AVMutableVideoCompositionLayerInstruction videoCompositionLayerInstructionWithAssetTrack:videoTrack];
-        [layerInstruction setTransform:transform atTime:kCMTimeZero];
-
-        instruction.layerInstructions = @[layerInstruction];
-        videoComposition.instructions = @[instruction];
-
         NSString *exportPath = [NSTemporaryDirectory() stringByAppendingPathComponent:@"vcam_oriented.mov"];
         NSFileManager *fm = [NSFileManager defaultManager];
         if ([fm fileExistsAtPath:exportPath]) [fm removeItemAtPath:exportPath error:nil];
@@ -229,15 +204,13 @@
         AVAssetExportSession *exportSession = [[AVAssetExportSession alloc] initWithAsset:asset presetName:AVAssetExportPresetHighestQuality];
         exportSession.outputURL = [NSURL fileURLWithPath:exportPath];
         exportSession.outputFileType = AVFileTypeQuickTimeMovie;
-        exportSession.videoComposition = videoComposition;
         exportSession.shouldOptimizeForNetworkUse = NO;
 
         [exportSession exportAsynchronouslyWithCompletionHandler:^{
             if (exportSession.status == AVAssetExportSessionStatusCompleted) {
-                NSLog(@"[VCAM] 方向烘焙导出成功");
                 [self copyToTempPath:exportPath];
             } else {
-                NSLog(@"[VCAM] 方向烘焙导出失败: %@", exportSession.error);
+                NSLog(@"[VCAM] 导出失败: %@", exportSession.error);
                 [self copyToTempPath:sourcePath];
             }
         }];
@@ -369,8 +342,5 @@
     [alert addAction:[UIAlertAction actionWithTitle:@"好的" style:UIAlertActionStyleDefault handler:nil]];
     [self presentViewController:alert animated:YES completion:nil];
 }
-- (void)showDebugLog {
-    VCAMDebugLogController *vc = [[VCAMDebugLogController alloc] init];
-    [self.navigationController pushViewController:vc animated:YES];
-}
+
 @end
