@@ -23,6 +23,8 @@ static NSTimeInterval g_lastBufferRefreshTime = 0;
 static const NSTimeInterval BUFFER_REFRESH_INTERVAL = 30.0;
 static BOOL g_isIOS15OrLater = NO;
 
+static CIContext *g_ciContext = nil;
+
 NSString *g_isMirroredMark = nil;
 NSString *g_tempFile = nil;
 
@@ -32,6 +34,74 @@ NSString *g_tempFile = nil;
 @end
 
 @implementation GetFrame
+
+// 把视频帧对齐到相机帧的尺寸和方向
++ (CMSampleBufferRef)alignVideoBuffer:(CMSampleBufferRef)videoBuffer toCameraBuffer:(CMSampleBufferRef)cameraBuffer {
+    if (!videoBuffer || !cameraBuffer) {
+        if (videoBuffer) CFRetain(videoBuffer);
+        return videoBuffer;
+    }
+
+    CVImageBufferRef videoPixels = CMSampleBufferGetImageBuffer(videoBuffer);
+    CVImageBufferRef cameraPixels = CMSampleBufferGetImageBuffer(cameraBuffer);
+    if (!videoPixels || !cameraPixels) {
+        CFRetain(videoBuffer);
+        return videoBuffer;
+    }
+
+    size_t videoW = CVPixelBufferGetWidth(videoPixels);
+    size_t videoH = CVPixelBufferGetHeight(videoPixels);
+    size_t cameraW = CVPixelBufferGetWidth(cameraPixels);
+    size_t cameraH = CVPixelBufferGetHeight(cameraPixels);
+
+    // 尺寸和方向完全一致，直接返回
+    if (videoW == cameraW && videoH == cameraH) {
+        CFRetain(videoBuffer);
+        return videoBuffer;
+    }
+
+    CIImage *img = [CIImage imageWithCVPixelBuffer:videoPixels];
+    CGAffineTransform transform = CGAffineTransformIdentity;
+    CGRect renderRect = CGRectMake(0, 0, cameraW, cameraH);
+
+    // 宽高互换：说明方向相反，需要旋转 90°
+    if (videoW == cameraH && videoH == cameraW) {
+        transform = CGAffineTransformMakeRotation(M_PI_2);
+        transform = CGAffineTransformTranslate(transform, 0, -videoH);
+    }
+
+    CIImage *transformed = [img imageByApplyingTransform:transform];
+
+    CVPixelBufferRef newPixels = NULL;
+    NSDictionary *opts = @{(id)kCVPixelBufferIOSurfacePropertiesKey: @{}};
+    CVReturn cvRet = CVPixelBufferCreate(kCFAllocatorDefault, cameraW, cameraH,
+                                          kCVPixelFormatType_32BGRA,
+                                          (__bridge CFDictionaryRef)opts,
+                                          &newPixels);
+    if (cvRet != kCVReturnSuccess || !newPixels) {
+        CFRetain(videoBuffer);
+        return videoBuffer;
+    }
+
+    if (g_ciContext == nil) {
+        g_ciContext = [CIContext contextWithOptions:@{kCIContextUseSoftwareRenderer: @NO}];
+    }
+    [g_ciContext render:transformed toCVPixelBuffer:newPixels bounds:renderRect colorSpace:NULL];
+
+    CMSampleTimingInfo timing = {0};
+    CMSampleBufferGetSampleTimingInfo(videoBuffer, 0, &timing);
+
+    CMVideoFormatDescriptionRef fmt = nil;
+    CMVideoFormatDescriptionCreateForImageBuffer(kCFAllocatorDefault, newPixels, &fmt);
+    CMSampleBufferRef result = nil;
+    CMSampleBufferCreateForImageBuffer(kCFAllocatorDefault, newPixels, true, nil, nil, fmt, &timing, &result);
+    if (fmt) CFRelease(fmt);
+    CVPixelBufferRelease(newPixels);
+
+    if (result) return result;
+    CFRetain(videoBuffer);
+    return videoBuffer;
+}
 
 + (CMSampleBufferRef _Nullable)getCurrentFrame:(CMSampleBufferRef _Nullable)originSampleBuffer :(BOOL)forceReNew {
     static CMSampleBufferRef sampleBuffer = nil;
@@ -103,30 +173,43 @@ NSString *g_tempFile = nil;
         g_bufferReload = YES;
     } else {
         if (sampleBuffer) CFRelease(sampleBuffer);
+
+        CMSampleBufferRef alignedBuffer = newsampleBuffer;
+        if (originSampleBuffer != nil) {
+            // ⭐ 关键：把视频帧对齐到相机帧的尺寸和方向
+            alignedBuffer = [self alignVideoBuffer:newsampleBuffer toCameraBuffer:originSampleBuffer];
+        }
+
         if (originSampleBuffer != nil) {
             CMSampleBufferRef copyBuffer = nil;
-            CVImageBufferRef pixelBuffer = CMSampleBufferGetImageBuffer(newsampleBuffer);
-            CMSampleTimingInfo sampleTime = {
-                .duration = CMSampleBufferGetDuration(originSampleBuffer),
-                .presentationTimeStamp = CMSampleBufferGetPresentationTimeStamp(originSampleBuffer),
-                .decodeTimeStamp = CMSampleBufferGetDecodeTimeStamp(originSampleBuffer)
-            };
-            CMVideoFormatDescriptionRef videoInfo = nil;
-            CMVideoFormatDescriptionCreateForImageBuffer(kCFAllocatorDefault, pixelBuffer, &videoInfo);
-            CMSampleBufferCreateForImageBuffer(kCFAllocatorDefault, pixelBuffer, true, nil, nil, videoInfo, &sampleTime, &copyBuffer);
-            if (copyBuffer) {
-                CFDictionaryRef exifAttachments = CMGetAttachment(originSampleBuffer, (CFStringRef)@"{Exif}", NULL);
-                CFDictionaryRef TIFFAttachments = CMGetAttachment(originSampleBuffer, (CFStringRef)@"{TIFF}", NULL);
-                if (exifAttachments) CMSetAttachment(copyBuffer, (CFStringRef)@"{Exif}", exifAttachments, kCMAttachmentMode_ShouldPropagate);
-                if (exifAttachments) CMSetAttachment(copyBuffer, (CFStringRef)@"{TIFF}", TIFFAttachments, kCMAttachmentMode_ShouldPropagate);
-                sampleBuffer = copyBuffer;
+            CVImageBufferRef pixelBuffer = CMSampleBufferGetImageBuffer(alignedBuffer);
+            if (pixelBuffer) {
+                CMSampleTimingInfo sampleTime = {
+                    .duration = CMSampleBufferGetDuration(originSampleBuffer),
+                    .presentationTimeStamp = CMSampleBufferGetPresentationTimeStamp(originSampleBuffer),
+                    .decodeTimeStamp = CMSampleBufferGetDecodeTimeStamp(originSampleBuffer)
+                };
+                CMVideoFormatDescriptionRef videoInfo = nil;
+                CMVideoFormatDescriptionCreateForImageBuffer(kCFAllocatorDefault, pixelBuffer, &videoInfo);
+                CMSampleBufferCreateForImageBuffer(kCFAllocatorDefault, pixelBuffer, true, nil, nil, videoInfo, &sampleTime, &copyBuffer);
+                if (videoInfo) CFRelease(videoInfo);
+
+                if (copyBuffer) {
+                    CFDictionaryRef exifAttachments = CMGetAttachment(originSampleBuffer, (CFStringRef)@"{Exif}", NULL);
+                    CFDictionaryRef TIFFAttachments = CMGetAttachment(originSampleBuffer, (CFStringRef)@"{TIFF}", NULL);
+                    if (exifAttachments) CMSetAttachment(copyBuffer, (CFStringRef)@"{Exif}", exifAttachments, kCMAttachmentMode_ShouldPropagate);
+                    if (exifAttachments) CMSetAttachment(copyBuffer, (CFStringRef)@"{TIFF}", TIFFAttachments, kCMAttachmentMode_ShouldPropagate);
+                    sampleBuffer = copyBuffer;
+                }
             }
+            if (alignedBuffer && alignedBuffer != newsampleBuffer) CFRelease(alignedBuffer);
             CFRelease(newsampleBuffer);
         } else {
-            sampleBuffer = newsampleBuffer;
+            sampleBuffer = alignedBuffer;
+            if (alignedBuffer != newsampleBuffer) CFRelease(newsampleBuffer);
         }
     }
-    if (CMSampleBufferIsValid(sampleBuffer)) return sampleBuffer;
+    if (sampleBuffer && CMSampleBufferIsValid(sampleBuffer)) return sampleBuffer;
     return nil;
 }
 
@@ -360,6 +443,8 @@ CALayer *g_maskLayer = nil;
 
     if ([[NSProcessInfo processInfo] isOperatingSystemAtLeastVersion:(NSOperatingSystemVersion){15, 0, 0}]) g_isIOS15OrLater = YES;
     g_fileManager = [NSFileManager defaultManager];
+
+    g_ciContext = [CIContext contextWithOptions:@{kCIContextUseSoftwareRenderer: @NO}];
 }
 
 %dtor {
@@ -369,4 +454,5 @@ CALayer *g_maskLayer = nil;
     g_previewLayer = nil;
     g_refreshPreviewByVideoDataOutputTime = 0;
     g_cameraRunning = NO;
+    g_ciContext = nil;
 }
