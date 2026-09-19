@@ -185,7 +185,7 @@
     [editor dismissViewControllerAnimated:YES completion:nil];
 }
 
-#pragma mark - 保存视频（含方向校正）
+#pragma mark - 保存视频（导出时把方向烘焙进像素数据）
 
 - (void)finalizeVideoWithPath:(NSString *)sourcePath {
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
@@ -198,18 +198,18 @@
         }
 
         CGAffineTransform transform = videoTrack.preferredTransform;
-        if (CGAffineTransformIsIdentity(transform)) {
-            [self copyToTempPath:sourcePath];
-            return;
-        }
-
-        // 需要做方向校正：把 preferredTransform 烘焙进像素数据
         CGSize naturalSize = videoTrack.naturalSize;
-        CGSize displaySize = CGSizeApplyAffineTransform(naturalSize, transform);
-        displaySize = CGSizeMake(fabs(displaySize.width), fabs(displaySize.height));
+
+        // ⭐ 用矩阵系数计算旋转后的正确渲染尺寸
+        CGFloat width = fabs(naturalSize.width * transform.a) + fabs(naturalSize.height * transform.c);
+        CGFloat height = fabs(naturalSize.width * transform.b) + fabs(naturalSize.height * transform.d);
+        CGSize renderSize = CGSizeMake(width, height);
+
+        NSLog(@"[VCAM] 视频原始尺寸 %.0fx%.0f，变换后渲染尺寸 %.0fx%.0f",
+              naturalSize.width, naturalSize.height, renderSize.width, renderSize.height);
 
         AVMutableVideoComposition *videoComposition = [AVMutableVideoComposition videoComposition];
-        videoComposition.renderSize = displaySize;
+        videoComposition.renderSize = renderSize;
         videoComposition.frameDuration = CMTimeMake(1, 30);
 
         AVMutableVideoCompositionInstruction *instruction = [AVMutableVideoCompositionInstruction videoCompositionInstruction];
@@ -233,9 +233,10 @@
 
         [exportSession exportAsynchronouslyWithCompletionHandler:^{
             if (exportSession.status == AVAssetExportSessionStatusCompleted) {
+                NSLog(@"[VCAM] 方向烘焙导出成功");
                 [self copyToTempPath:exportPath];
             } else {
-                NSLog(@"[VCAM] 方向校正导出失败: %@", exportSession.error);
+                NSLog(@"[VCAM] 方向烘焙导出失败: %@", exportSession.error);
                 [self copyToTempPath:sourcePath];
             }
         }];
