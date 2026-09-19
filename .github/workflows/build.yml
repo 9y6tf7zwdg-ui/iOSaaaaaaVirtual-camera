@@ -14,17 +14,19 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Theos
+      - name: Setup Theos (RootHide Branch)
         run: |
           brew install ldid dpkg
           export THEOS=$HOME/theos
-          git clone --recursive https://github.com/theos/theos.git $THEOS
+          # 关键：克隆 RootHide 专属的 Theos 分支
+          git clone -b roothide --recursive https://github.com/roothide/theos.git $THEOS
           echo "THEOS=$THEOS" >> $GITHUB_ENV
           echo "$THEOS/bin" >> $GITHUB_PATH
 
       - name: Build package
         run: |
-          make package THEOS_DEVICE_IP=127.0.0.1
+          make clean || true
+          make package FINALPACKAGE=1 THEOS_DEVICE_IP=127.0.0.1
 
       - name: Upload deb
         uses: actions/upload-artifact@v4
