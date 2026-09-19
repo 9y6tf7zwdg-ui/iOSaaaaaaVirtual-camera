@@ -5,6 +5,7 @@ INSTALL_TARGET_PROCESSES = SpringBoard Camera
 include $(THEOS)/makefiles/common.mk
 
 TWEAK_NAME = VCAM
+THEOS_PACKAGE_SCHEME = rootless
 VCAM_FILES = Tweak.x
 VCAM_CFLAGS = -fobjc-arc -Wno-unused-variable -Wno-deprecated-declarations -Wno-error
 
