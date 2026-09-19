@@ -4,23 +4,8 @@
 #import <Foundation/Foundation.h>
 #include <stdarg.h>
 
-// ============================================================
-// VCAM 通用调试日志
-// 用法：
-//   1) 在 .x 文件顶部：#import "VCAMDebugLog.h"
-//   2) 在 %ctor 里：    VCAM_LOG_STARTUP();
-//   3) 在任意位置：      VCAM_LOG(@"message %@", obj);
-//
-// 日志文件路径：/var/mobile/VCAM_debug.log
-// 每行格式：[HH:mm:ss.SSS][进程名][文件名:行号] 消息
-// ============================================================
-
 static inline NSString *VCAMDebugLogPath(void) {
     return @"/var/mobile/VCAM_debug.log";
-}
-
-static inline NSString *VCAMDebugCurrentProcess(void) {
-    return [[NSProcessInfo processInfo] processName];
 }
 
 static inline void VCAMDebugLogWrite(NSString *line) {
@@ -30,10 +15,7 @@ static inline void VCAMDebugLogWrite(NSString *line) {
     @try {
         NSFileManager *fm = [NSFileManager defaultManager];
         if (![fm fileExistsAtPath:VCAMDebugLogPath()]) {
-            [line writeToFile:VCAMDebugLogPath()
-                   atomically:YES
-                     encoding:NSUTF8StringEncoding
-                        error:nil];
+            [line writeToFile:VCAMDebugLogPath() atomically:YES encoding:NSUTF8StringEncoding error:nil];
         } else {
             NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:VCAMDebugLogPath()];
             if (fh) {
@@ -57,14 +39,10 @@ static inline void VCAMDebugLogInternal(const char *file, int line, NSString *fo
     NSDateFormatter *df = [[NSDateFormatter alloc] init];
     df.dateFormat = @"HH:mm:ss.SSS";
     NSString *timestamp = [df stringFromDate:[NSDate date]];
-
     NSString *fileName = [[NSString stringWithUTF8String:file] lastPathComponent];
+
     NSString *lineStr = [NSString stringWithFormat:@"[%@][%@][%@:%d] %@\n",
-                         timestamp,
-                         VCAMDebugCurrentProcess(),
-                         fileName,
-                         line,
-                         msg];
+                         timestamp, [[NSProcessInfo processInfo] processName], fileName, line, msg];
 
     NSLog(@"[VCAM-Debug] %@", msg);
     VCAMDebugLogWrite(lineStr);
@@ -79,19 +57,14 @@ static inline void VCAMDebugLogClear(void) {
 
 static inline NSString *VCAMDebugLogRead(void) {
     NSError *err = nil;
-    NSString *content = [NSString stringWithContentsOfFile:VCAMDebugLogPath()
-                                                  encoding:NSUTF8StringEncoding
-                                                     error:&err];
+    NSString *content = [NSString stringWithContentsOfFile:VCAMDebugLogPath() encoding:NSUTF8StringEncoding error:&err];
     if (err || !content || content.length == 0) {
-        return @"（暂无日志）\n\n打开目标 App 后再回来查看。";
+        return @"（暂无日志）\n\n请打开目标 App 后再回来查看。";
     }
     return content;
 }
 
-#define VCAM_LOG(fmt, ...) \
-    VCAMDebugLogInternal(__FILE__, __LINE__, fmt, ##__VA_ARGS__)
-
-#define VCAM_LOG_STARTUP() \
-    VCAMDebugLogInternal(__FILE__, __LINE__, @"========= 已加载 =========")
+#define VCAM_LOG(fmt, ...) VCAMDebugLogInternal(__FILE__, __LINE__, fmt, ##__VA_ARGS__)
+#define VCAM_LOG_STARTUP() VCAMDebugLogInternal(__FILE__, __LINE__, @"========= 已加载 =========")
 
 #endif
