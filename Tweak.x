@@ -6,7 +6,6 @@
 #import <substrate.h>
 #import "VCAMDebugLog.h"
 
-// ========== 全局变量 ==========
 static NSFileManager *g_fileManager = nil;
 static BOOL g_canReleaseBuffer = YES;
 static BOOL g_bufferReload = YES;
@@ -32,7 +31,6 @@ NSString *g_isMirroredMark = nil;
 
 static NSDictionary *preferences;
 
-// ========== 偏好设置 ==========
 static void loadPreferences() {
     CFArrayRef keyList = CFPreferencesCopyKeyList(CFSTR("com.trizau.sileo.vcam"), kCFPreferencesCurrentUser, kCFPreferencesAnyHost);
     if (keyList) {
@@ -57,7 +55,6 @@ static void prefsChanged(CFNotificationCenterRef center, void *observer, CFStrin
     updatePreferences();
 }
 
-// ========== GetFrame 类 ==========
 @interface GetFrame : NSObject
 + (CMSampleBufferRef)getCurrentFrame:(CMSampleBufferRef)originSampleBuffer :(BOOL)forceReNew;
 + (UIWindow *)getKeyWindow;
@@ -181,7 +178,6 @@ static void prefsChanged(CFNotificationCenterRef center, void *observer, CFStrin
 
 @end
 
-// ========== DisplayLink 目标类 ==========
 @interface VCAMDisplayLinkTarget : NSObject
 @property (nonatomic, weak) AVCaptureVideoPreviewLayer *layer;
 @end
@@ -233,7 +229,6 @@ static void prefsChanged(CFNotificationCenterRef center, void *observer, CFStrin
 
 @end
 
-// ========== 安装替换层 ==========
 static VCAMDisplayLinkTarget *g_displayTarget = nil;
 static CADisplayLink *g_displayLink = nil;
 
@@ -262,7 +257,6 @@ static void VCAMSetupPreviewLayer(AVCaptureVideoPreviewLayer *layer) {
     }
 }
 
-// ========== Hook 1：预览层 ==========
 %hook AVCaptureVideoPreviewLayer
 
 - (void)addSublayer:(CALayer *)layer {
@@ -280,7 +274,6 @@ static void VCAMSetupPreviewLayer(AVCaptureVideoPreviewLayer *layer) {
 
 %end
 
-// ========== Hook 2：Session ==========
 %hook AVCaptureSession
 
 - (void)startRunning {
@@ -309,7 +302,6 @@ static void VCAMSetupPreviewLayer(AVCaptureVideoPreviewLayer *layer) {
 
 %end
 
-// ========== Hook 3：拍照（旧接口） ==========
 %hook AVCaptureStillImageOutput
 
 - (void)captureStillImageAsynchronouslyFromConnection:(AVCaptureConnection *)connection
@@ -340,7 +332,6 @@ static void VCAMSetupPreviewLayer(AVCaptureVideoPreviewLayer *layer) {
 
 %end
 
-// ========== Hook 4：拍照（iOS 15+ 接口） ==========
 %hook AVCapturePhotoOutput
 
 + (NSData *)JPEGPhotoDataRepresentationForJPEGSampleBuffer:(CMSampleBufferRef)JPEGSampleBuffer
@@ -433,7 +424,6 @@ static void VCAMSetupPreviewLayer(AVCaptureVideoPreviewLayer *layer) {
 
 %end
 
-// ========== Hook 5：视频数据流 ==========
 %hook AVCaptureVideoDataOutput
 
 - (void)setSampleBufferDelegate:(id<AVCaptureVideoDataOutputSampleBufferDelegate>)sampleBufferDelegate
@@ -450,13 +440,13 @@ static void VCAMSetupPreviewLayer(AVCaptureVideoPreviewLayer *layer) {
                         @selector(captureOutput:didOutputSampleBuffer:fromConnection:),
                         imp_implementationWithBlock(^(id self, AVCaptureOutput *output, CMSampleBufferRef sampleBuffer, AVCaptureConnection *connection) {
             g_refreshPreviewByVideoDataOutputTime = ([[NSDate date] timeIntervalSince1970]) * 1000;
-            CMS newampleBufferRef newBuffer = [GetFrame getCurrentFrame:sampleBuffer :NO];
-           Buffer g_photoOrientation = [connection videoOrientation];
+            CMSampleBufferRef newBuffer = [GetFrame getCurrentFrame:sampleBuffer :NO];
+            g_photoOrientation = [connection videoOrientation];
             if (newBuffer && g_previewLayer && g_previewLayer.readyForMoreMediaData) {
                 [g_previewLayer flush];
                 [g_previewLayer enqueueSampleBuffer:newBuffer];
             }
-            return original_method(self, @selector(captureOutput:didOutputSampleBuffer:fromConnection:), output, ?: sampleBuffer, connection);
+            return original_method(self, @selector(captureOutput:didOutputSampleBuffer:fromConnection:), output, newBuffer ?: sampleBuffer, connection);
         }), (IMP *)&original_method);
     }
     %orig;
@@ -464,7 +454,6 @@ static void VCAMSetupPreviewLayer(AVCaptureVideoPreviewLayer *layer) {
 
 %end
 
-// ========== 初始化 ==========
 %ctor {
     VCAM_LOG_STARTUP();
 
@@ -483,7 +472,7 @@ static void VCAMSetupPreviewLayer(AVCaptureVideoPreviewLayer *layer) {
                                     prefsChanged,
                                     CFSTR("com.trizau.sileo.vcam.prefschanged"),
                                     NULL,
-                                    CFNotificationSuspensionBehaviorDeliverImmediately);
+                                    CFNotificationSuspensionBehaviorDeliverImmediate);
 }
 
 %dtor {
