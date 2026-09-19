@@ -1,7 +1,6 @@
 BUNDLE_NAME = VCAMPrefs
 VCAMPrefs_FILES = VCAMRootListController.m
 VCAMPrefs_FRAMEWORKS = UIKit
-VCAMPrefs_PRIVATE_FRAMEWORKS = Preferences
 VCAMPrefs_LDFLAGS = -undefined dynamic_lookup
 VCAMPrefs_INSTALL_PATH = /Library/PreferenceBundles
 
