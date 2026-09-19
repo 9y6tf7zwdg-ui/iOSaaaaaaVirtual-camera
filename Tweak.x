@@ -6,15 +6,18 @@
 #import <substrate.h>
 #import "VCAMDebugLog.h"
 
+// ========== 全局变量 ==========
 static NSFileManager *g_fileManager = nil;
 static BOOL g_canReleaseBuffer = YES;
 static BOOL g_bufferReload = YES;
 static AVSampleBufferDisplayLayer *g_previewLayer = nil;
+static CALayer *g_maskLayer = nil;
 static NSTimeInterval g_refreshPreviewByVideoDataOutputTime = 0;
 static BOOL g_cameraRunning = NO;
 static NSString *g_cameraPosition = @"B";
 static AVCaptureVideoOrientation g_photoOrientation = AVCaptureVideoOrientationPortrait;
 static BOOL g_isIOS15OrLater = NO;
+static BOOL g_systemCameraMode = NO;
 
 static AVAssetReader *reader = nil;
 static AVAssetReaderTrackOutput *videoTrackout_32BGRA = nil;
@@ -27,10 +30,37 @@ static const NSTimeInterval BUFFER_REFRESH_INTERVAL = 30.0;
 NSString *g_tempFile = nil;
 NSString *g_isMirroredMark = nil;
 
-#pragma mark - GetFrame
+static NSDictionary *preferences;
 
+// ========== 偏好设置 ==========
+static void loadPreferences() {
+    CFArrayRef keyList = CFPreferencesCopyKeyList(CFSTR("com.trizau.sileo.vcam"), kCFPreferencesCurrentUser, kCFPreferencesAnyHost);
+    if (keyList) {
+        preferences = (__bridge NSDictionary *)CFPreferencesCopyMultiple(keyList, CFSTR("com.trizau.sileo.vcam"), kCFPreferencesCurrentUser, kCFPreferencesAnyHost);
+        CFRelease(keyList);
+    }
+}
+
+static BOOL getBoolFromPreferences(NSString *key, BOOL defaultValue) {
+    if (preferences && [preferences objectForKey:key]) {
+        return [[preferences objectForKey:key] boolValue];
+    }
+    return defaultValue;
+}
+
+static void updatePreferences() {
+    loadPreferences();
+    g_systemCameraMode = getBoolFromPreferences(@"systemCameraMode", NO);
+}
+
+static void prefsChanged(CFNotificationCenterRef center, void *observer, CFStringRef name, const void *object, CFDictionaryRef userInfo) {
+    updatePreferences();
+}
+
+// ========== GetFrame 类 ==========
 @interface GetFrame : NSObject
 + (CMSampleBufferRef)getCurrentFrame:(CMSampleBufferRef)originSampleBuffer :(BOOL)forceReNew;
++ (UIWindow *)getKeyWindow;
 @end
 
 @implementation GetFrame
@@ -40,6 +70,7 @@ NSString *g_isMirroredMark = nil;
     CMFormatDescriptionRef formatDescription = nil;
     CMMediaType mediaType = -1;
     CMMediaType subMediaType = -1;
+
     if (originSampleBuffer != nil) {
         formatDescription = CMSampleBufferGetFormatDescription(originSampleBuffer);
         mediaType = CMFormatDescriptionGetMediaType(formatDescription);
@@ -119,6 +150,7 @@ NSString *g_isMirroredMark = nil;
             CMVideoFormatDescriptionCreateForImageBuffer(kCFAllocatorDefault, pixelBuffer, &videoInfo);
             CMSampleBufferCreateForImageBuffer(kCFAllocatorDefault, pixelBuffer, true, nil, nil, videoInfo, &sampleTime, &copyBuffer);
             if (videoInfo) CFRelease(videoInfo);
+
             if (copyBuffer) {
                 CFDictionaryRef exifAttachments = CMGetAttachment(originSampleBuffer, (CFStringRef)@"{Exif}", NULL);
                 CFDictionaryRef TIFFAttachments = CMGetAttachment(originSampleBuffer, (CFStringRef)@"{TIFF}", NULL);
@@ -136,12 +168,20 @@ NSString *g_isMirroredMark = nil;
     return nil;
 }
 
++ (UIWindow *)getKeyWindow {
+    UIWindow *keyWindow = nil;
+    for (UIWindow *window in UIApplication.sharedApplication.windows) {
+        if (window.isKeyWindow) {
+            keyWindow = window;
+            break;
+        }
+    }
+    return keyWindow;
+}
+
 @end
 
-#pragma mark - DisplayLink Target
-
-CALayer *g_maskLayer = nil;
-
+// ========== DisplayLink 目标类 ==========
 @interface VCAMDisplayLinkTarget : NSObject
 @property (nonatomic, weak) AVCaptureVideoPreviewLayer *layer;
 @end
@@ -193,8 +233,7 @@ CALayer *g_maskLayer = nil;
 
 @end
 
-#pragma mark - 安装替换层
-
+// ========== 安装替换层 ==========
 static VCAMDisplayLinkTarget *g_displayTarget = nil;
 static CADisplayLink *g_displayLink = nil;
 
@@ -223,8 +262,7 @@ static void VCAMSetupPreviewLayer(AVCaptureVideoPreviewLayer *layer) {
     }
 }
 
-#pragma mark - Hook
-
+// ========== Hook 1：预览层（含系统相机 didMoveToSuperlayer） ==========
 %hook AVCaptureVideoPreviewLayer
 
 - (void)addSublayer:(CALayer *)layer {
@@ -235,11 +273,14 @@ static void VCAMSetupPreviewLayer(AVCaptureVideoPreviewLayer *layer) {
 - (void)didMoveToSuperlayer {
     %orig;
     VCAM_LOG(@"didMoveToSuperlayer: superlayer=%@", NSStringFromClass([self.superlayer class]));
-    VCAMSetupPreviewLayer(self);
+    if (g_systemCameraMode) {
+        VCAMSetupPreviewLayer(self);
+    }
 }
 
 %end
 
+// ========== Hook 2：Session ==========
 %hook AVCaptureSession
 
 - (void)startRunning {
@@ -262,8 +303,13 @@ static void VCAMSetupPreviewLayer(AVCaptureVideoPreviewLayer *layer) {
     %orig;
 }
 
+- (void)addOutput:(AVCaptureOutput *)output {
+    %orig;
+}
+
 %end
 
+// ========== Hook 3：拍照（旧接口） ==========
 %hook AVCaptureStillImageOutput
 
 - (void)captureStillImageAsynchronouslyFromConnection:(AVCaptureConnection *)connection
@@ -284,6 +330,9 @@ static void VCAMSetupPreviewLayer(AVCaptureVideoPreviewLayer *layer) {
         CVImageBufferRef pixelBuffer = CMSampleBufferGetImageBuffer(newBuffer);
         CIImage *ciimage = [CIImage imageWithCVImageBuffer:pixelBuffer];
         UIImage *uiimage = [UIImage imageWithCIImage:ciimage scale:2.0f orientation:UIImageOrientationUp];
+        if ([g_fileManager fileExistsAtPath:g_isMirroredMark]) {
+            uiimage = [UIImage imageWithCIImage:ciimage scale:2.0f orientation:UIImageOrientationUpMirrored];
+        }
         return UIImageJPEGRepresentation(uiimage, 1);
     }
     return %orig;
@@ -291,6 +340,7 @@ static void VCAMSetupPreviewLayer(AVCaptureVideoPreviewLayer *layer) {
 
 %end
 
+// ========== Hook 4：拍照（iOS 15+ 接口） ==========
 %hook AVCapturePhotoOutput
 
 + (NSData *)JPEGPhotoDataRepresentationForJPEGSampleBuffer:(CMSampleBufferRef)JPEGSampleBuffer
@@ -300,6 +350,9 @@ static void VCAMSetupPreviewLayer(AVCaptureVideoPreviewLayer *layer) {
         CVImageBufferRef pixelBuffer = CMSampleBufferGetImageBuffer(newBuffer);
         CIImage *ciimage = [CIImage imageWithCVImageBuffer:pixelBuffer];
         UIImage *uiimage = [UIImage imageWithCIImage:ciimage scale:2.0f orientation:UIImageOrientationUp];
+        if ([g_fileManager fileExistsAtPath:g_isMirroredMark]) {
+            uiimage = [UIImage imageWithCIImage:ciimage scale:2.0f orientation:UIImageOrientationUpMirrored];
+        }
         return UIImageJPEGRepresentation(uiimage, 1);
     }
     return %orig;
@@ -380,6 +433,7 @@ static void VCAMSetupPreviewLayer(AVCaptureVideoPreviewLayer *layer) {
 
 %end
 
+// ========== Hook 5：视频数据流 ==========
 %hook AVCaptureVideoDataOutput
 
 - (void)setSampleBufferDelegate:(id<AVCaptureVideoDataOutputSampleBufferDelegate>)sampleBufferDelegate
@@ -410,8 +464,7 @@ static void VCAMSetupPreviewLayer(AVCaptureVideoPreviewLayer *layer) {
 
 %end
 
-#pragma mark - 初始化
-
+// ========== 初始化 ==========
 %ctor {
     VCAM_LOG_STARTUP();
 
@@ -422,6 +475,15 @@ static void VCAMSetupPreviewLayer(AVCaptureVideoPreviewLayer *layer) {
         g_isIOS15OrLater = YES;
     }
     g_fileManager = [NSFileManager defaultManager];
+
+    updatePreferences();
+
+    CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(),
+                                    NULL,
+                                    prefsChanged,
+                                    CFSTR("com.trizau.sileo.vcam.prefschanged"),
+                                    NULL,
+                                    CFNotificationSuspensionBehaviorDeliverImmediately);
 }
 
 %dtor {
