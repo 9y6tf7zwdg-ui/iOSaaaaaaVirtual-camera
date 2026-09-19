@@ -19,17 +19,10 @@ static AVAssetReaderTrackOutput *videoTrackout_32BGRA = nil;
 static AVAssetReaderTrackOutput *videoTrackout_420YpCbCr8BiPlanarVideoRange = nil;
 static AVAssetReaderTrackOutput *videoTrackout_420YpCbCr8BiPlanarFullRange = nil;
 
-static AVAssetReader *g_audioReader = nil;
-static AVAssetReaderTrackOutput *g_audioReplacementOutput = nil;
-static AudioStreamBasicDescription g_micAudioFormat = {0};
-static BOOL g_audioInjectionReady = NO;
-static BOOL g_audioEnabled = YES;
-
-#define AUDIO_RING_BUFFER_SIZE (48000 * 4)
-static int16_t *g_audioRingBuffer = NULL;
-static volatile int g_audioRingBufferReadPos = 0;
-static volatile int g_audioRingBufferWritePos = 0;
-static volatile int g_audioRingBufferAvailable = 0;
+// 视频方向校正
+static CGAffineTransform g_videoPreferredTransform = CGAffineTransformIdentity;
+static CGSize g_videoNaturalSize = CGSizeZero;
+static CIContext *g_ciContext = nil;
 
 static NSTimeInterval g_lastBufferRefreshTime = 0;
 static const NSTimeInterval BUFFER_REFRESH_INTERVAL = 30.0;
@@ -38,153 +31,11 @@ static BOOL g_isIOS15OrLater = NO;
 NSString *g_isMirroredMark = nil;
 NSString *g_tempFile = nil;
 
-static NSDictionary *preferences;
-
-// ========== 前向声明（必须在 Hook 之前） ==========
 @interface GetFrame : NSObject
 + (CMSampleBufferRef _Nullable)getCurrentFrame:(CMSampleBufferRef)originSampleBuffer :(BOOL)forceReNew;
 + (UIWindow*)getKeyWindow;
-+ (void)setupAudioInjectionWithFormat:(AudioStreamBasicDescription)format;
 @end
 
-// ========== 偏好设置 ==========
-static void loadPreferences() {
-    CFArrayRef keyList = CFPreferencesCopyKeyList(CFSTR("com.trizau.sileo.vcam"), kCFPreferencesCurrentUser, kCFPreferencesAnyHost);
-    if (keyList) {
-        preferences = (__bridge NSDictionary *)CFPreferencesCopyMultiple(keyList, CFSTR("com.trizau.sileo.vcam"), kCFPreferencesCurrentUser, kCFPreferencesAnyHost);
-        CFRelease(keyList);
-    }
-}
-
-static BOOL getBoolFromPreferences(NSString *key, BOOL defaultValue) {
-    if (preferences && [preferences objectForKey:key]) {
-        return [[preferences objectForKey:key] boolValue];
-    }
-    return defaultValue;
-}
-
-static void updatePreferences() {
-    loadPreferences();
-    g_audioEnabled = getBoolFromPreferences(@"enableAudio", YES);
-}
-
-static void prefsChanged(CFNotificationCenterRef center, void *observer, CFStringRef name, const void *object, CFDictionaryRef userInfo) {
-    updatePreferences();
-}
-
-// ========== AudioUnitRender Hook ==========
-static OSStatus (*AudioUnitRender_orig)(
-    AudioUnit inUnit,
-    AudioUnitRenderActionFlags *ioActionFlags,
-    const AudioTimeStamp *inTimeStamp,
-    UInt32 inOutputBusNumber,
-    UInt32 inNumberFrames,
-    AudioBufferList *ioData
-) = NULL;
-
-static void ensureRingBufferAllocated() {
-    if (g_audioRingBuffer == NULL) {
-        g_audioRingBuffer = (int16_t *)calloc(AUDIO_RING_BUFFER_SIZE, sizeof(int16_t));
-    }
-}
-
-static void resetRingBuffer() {
-    g_audioRingBufferReadPos = 0;
-    g_audioRingBufferWritePos = 0;
-    g_audioRingBufferAvailable = 0;
-}
-
-static void fillRingBufferFromVideo() {
-    if (!g_audioReplacementOutput || !g_audioReader) return;
-    ensureRingBufferAllocated();
-
-    while (g_audioRingBufferAvailable < AUDIO_RING_BUFFER_SIZE - 4800) {
-        CMSampleBufferRef audioBuffer = [g_audioReplacementOutput copyNextSampleBuffer];
-        if (!audioBuffer) {
-            [g_audioReader cancelReading];
-            g_audioReader = nil;
-            g_audioReplacementOutput = nil;
-            g_audioInjectionReady = NO;
-            return;
-        }
-
-        CMBlockBufferRef blockBuffer = CMSampleBufferGetDataBuffer(audioBuffer);
-        if (blockBuffer) {
-            size_t totalLength = 0;
-            char *dataPointer = NULL;
-            CMBlockBufferGetDataPointer(blockBuffer, 0, NULL, &totalLength, &dataPointer);
-            if (dataPointer && totalLength > 0) {
-                int samples = (int)(totalLength / sizeof(int16_t));
-                int16_t *src = (int16_t *)dataPointer;
-                for (int i = 0; i < samples && g_audioRingBufferAvailable < AUDIO_RING_BUFFER_SIZE; i++) {
-                    g_audioRingBuffer[g_audioRingBufferWritePos] = src[i];
-                    g_audioRingBufferWritePos = (g_audioRingBufferWritePos + 1) % AUDIO_RING_BUFFER_SIZE;
-                    g_audioRingBufferAvailable++;
-                }
-            }
-        }
-        CFRelease(audioBuffer);
-    }
-}
-
-static OSStatus AudioUnitRender_hook(
-    AudioUnit inUnit,
-    AudioUnitRenderActionFlags *ioActionFlags,
-    const AudioTimeStamp *inTimeStamp,
-    UInt32 inOutputBusNumber,
-    UInt32 inNumberFrames,
-    AudioBufferList *ioData
-) {
-    OSStatus status = AudioUnitRender_orig(inUnit, ioActionFlags, inTimeStamp,
-                                            inOutputBusNumber, inNumberFrames, ioData);
-
-    if (status != noErr || inOutputBusNumber != 1 || !g_audioEnabled) {
-        return status;
-    }
-
-    if (!g_audioInjectionReady) {
-        if (ioData && ioData->mNumberBuffers > 0) {
-            AudioBuffer *buffer = &ioData->mBuffers[0];
-            g_micAudioFormat.mSampleRate = 44100.0;
-            g_micAudioFormat.mChannelsPerFrame = buffer->mNumberChannels;
-            g_micAudioFormat.mBitsPerChannel = 16;
-            g_micAudioFormat.mFormatID = kAudioFormatLinearPCM;
-            g_micAudioFormat.mFormatFlags = kAudioFormatFlagIsSignedInteger | kAudioFormatFlagIsPacked;
-            g_micAudioFormat.mBytesPerFrame = g_micAudioFormat.mChannelsPerFrame * sizeof(int16_t);
-            g_micAudioFormat.mFramesPerPacket = 1;
-            g_micAudioFormat.mBytesPerPacket = g_micAudioFormat.mBytesPerFrame;
-
-            [GetFrame setupAudioInjectionWithFormat:g_micAudioFormat];
-        }
-        if (!g_audioInjectionReady) return status;
-    }
-
-    if (ioData && ioData->mNumberBuffers > 0) {
-        AudioBuffer *buffer = &ioData->mBuffers[0];
-        int16_t *outputData = (int16_t *)buffer->mData;
-        int samplesNeeded = inNumberFrames * buffer->mNumberChannels;
-
-        for (int i = 0; i < samplesNeeded; i++) {
-            if (g_audioRingBufferAvailable > 0) {
-                outputData[i] = g_audioRingBuffer[g_audioRingBufferReadPos];
-                g_audioRingBufferReadPos = (g_audioRingBufferReadPos + 1) % AUDIO_RING_BUFFER_SIZE;
-                g_audioRingBufferAvailable--;
-            } else {
-                outputData[i] = 0;
-            }
-        }
-
-        if (g_audioRingBufferAvailable < 4800) {
-            dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-                fillRingBufferFromVideo();
-            });
-        }
-    }
-
-    return status;
-}
-
-// ========== GetFrame 实现 ==========
 @implementation GetFrame
 
 + (CMSampleBufferRef _Nullable)getCurrentFrame:(CMSampleBufferRef _Nullable)originSampleBuffer :(BOOL)forceReNew {
@@ -217,6 +68,11 @@ static OSStatus AudioUnitRender_hook(
             AVAsset *asset = [AVAsset assetWithURL:[NSURL URLWithString:[NSString stringWithFormat:@"file://%@", g_tempFile]]];
             reader = [AVAssetReader assetReaderWithAsset:asset error:nil];
             AVAssetTrack *videoTrack = [[asset tracksWithMediaType:AVMediaTypeVideo] firstObject];
+
+            // 保存视频轨道的方向信息
+            g_videoPreferredTransform = videoTrack.preferredTransform;
+            g_videoNaturalSize = videoTrack.naturalSize;
+
             videoTrackout_32BGRA = [[AVAssetReaderTrackOutput alloc] initWithTrack:videoTrack outputSettings:@{(id)kCVPixelBufferPixelFormatTypeKey:@(kCVPixelFormatType_32BGRA)}];
             videoTrackout_420YpCbCr8BiPlanarVideoRange = [[AVAssetReaderTrackOutput alloc] initWithTrack:videoTrack outputSettings:@{(id)kCVPixelBufferPixelFormatTypeKey:@(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange)}];
             videoTrackout_420YpCbCr8BiPlanarFullRange = [[AVAssetReaderTrackOutput alloc] initWithTrack:videoTrack outputSettings:@{(id)kCVPixelBufferPixelFormatTypeKey:@(kCVPixelFormatType_420YpCbCr8BiPlanarFullRange)}];
@@ -255,9 +111,13 @@ static OSStatus AudioUnitRender_hook(
         g_bufferReload = YES;
     } else {
         if (sampleBuffer) CFRelease(sampleBuffer);
+
+        // 应用方向校正
+        CMSampleBufferRef orientedBuffer = [self applyOrientation:newsampleBuffer];
+
         if (originSampleBuffer != nil) {
             CMSampleBufferRef copyBuffer = nil;
-            CVImageBufferRef pixelBuffer = CMSampleBufferGetImageBuffer(newsampleBuffer);
+            CVImageBufferRef pixelBuffer = CMSampleBufferGetImageBuffer(orientedBuffer);
             CMSampleTimingInfo sampleTime = {
                 .duration = CMSampleBufferGetDuration(originSampleBuffer),
                 .presentationTimeStamp = CMSampleBufferGetPresentationTimeStamp(originSampleBuffer),
@@ -273,53 +133,87 @@ static OSStatus AudioUnitRender_hook(
                 if (exifAttachments) CMSetAttachment(copyBuffer, (CFStringRef)@"{TIFF}", TIFFAttachments, kCMAttachmentMode_ShouldPropagate);
                 sampleBuffer = copyBuffer;
             }
+            if (orientedBuffer && orientedBuffer != newsampleBuffer) CFRelease(orientedBuffer);
             CFRelease(newsampleBuffer);
         } else {
-            sampleBuffer = newsampleBuffer;
+            sampleBuffer = orientedBuffer;
+            if (orientedBuffer != newsampleBuffer) CFRelease(newsampleBuffer);
         }
     }
     if (CMSampleBufferIsValid(sampleBuffer)) return sampleBuffer;
     return nil;
 }
 
-+ (void)setupAudioInjectionWithFormat:(AudioStreamBasicDescription)format {
-    if (g_audioInjectionReady) return;
-    if (!g_audioEnabled) return;
-    if (![g_fileManager fileExistsAtPath:g_tempFile]) return;
-
-    @try {
-        AVAsset *asset = [AVAsset assetWithURL:[NSURL URLWithString:[NSString stringWithFormat:@"file://%@", g_tempFile]]];
-        AVAssetTrack *audioTrack = [[asset tracksWithMediaType:AVMediaTypeAudio] firstObject];
-        if (!audioTrack) {
-            NSLog(@"[VCAM] 视频无音轨，跳过音频注入");
-            return;
-        }
-
-        NSDictionary *outputSettings = @{
-            AVFormatIDKey: @(kAudioFormatLinearPCM),
-            AVSampleRateKey: @(format.mSampleRate),
-            AVNumberOfChannelsKey: @(format.mChannelsPerFrame),
-            AVLinearPCMBitDepthKey: @(16),
-            AVLinearPCMIsFloatKey: @(NO),
-            AVLinearPCMIsNonInterleaved: @(NO),
-        };
-
-        g_audioReader = [AVAssetReader assetReaderWithAsset:asset error:nil];
-        g_audioReplacementOutput = [[AVAssetReaderTrackOutput alloc] initWithTrack:audioTrack outputSettings:outputSettings];
-        g_audioReplacementOutput.alwaysCopiesSampleData = NO;
-        if ([g_audioReader canAddOutput:g_audioReplacementOutput]) {
-            [g_audioReader addOutput:g_audioReplacementOutput];
-            [g_audioReader startReading];
-            g_micAudioFormat = format;
-            g_audioInjectionReady = YES;
-            ensureRingBufferAllocated();
-            resetRingBuffer();
-            fillRingBufferFromVideo();
-            NSLog(@"[VCAM] 音频注入已就绪，格式: %.0fHz %d声道", format.mSampleRate, format.mChannelsPerFrame);
-        }
-    } @catch (NSException *e) {
-        NSLog(@"[VCAM] 音频注入初始化失败: %@", e);
+// 应用视频方向校正
++ (CMSampleBufferRef)applyOrientation:(CMSampleBufferRef)originalBuffer {
+    // 如果方向是默认的，直接返回
+    if (CGAffineTransformIsIdentity(g_videoPreferredTransform)) {
+        CFRetain(originalBuffer);
+        return originalBuffer;
     }
+
+    CVImageBufferRef pixelBuffer = CMSampleBufferGetImageBuffer(originalBuffer);
+    if (!pixelBuffer) {
+        CFRetain(originalBuffer);
+        return originalBuffer;
+    }
+
+    CIImage *ciImage = [CIImage imageWithCVPixelBuffer:pixelBuffer];
+    CIImage *transformedImage = [ciImage imageByApplyingTransform:g_videoPreferredTransform];
+
+    CGRect extent = transformedImage.extent;
+    size_t width = (size_t)extent.size.width;
+    size_t height = (size_t)extent.size.height;
+
+    if (width == 0 || height == 0) {
+        CFRetain(originalBuffer);
+        return originalBuffer;
+    }
+
+    CVPixelBufferRef newPixelBuffer = NULL;
+    NSDictionary *options = @{
+        (id)kCVPixelBufferCGImageCompatibilityKey: @YES,
+        (id)kCVPixelBufferCGBitmapContextCompatibilityKey: @YES,
+        (id)kCVPixelBufferIOSurfacePropertiesKey: @{}
+    };
+    CVReturn result = CVPixelBufferCreate(kCFAllocatorDefault, width, height,
+                                           kCVPixelFormatType_32BGRA,
+                                           (__bridge CFDictionaryRef)options,
+                                           &newPixelBuffer);
+    if (result != kCVReturnSuccess || newPixelBuffer == NULL) {
+        CFRetain(originalBuffer);
+        return originalBuffer;
+    }
+
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        g_ciContext = [CIContext contextWithOptions:@{kCIContextUseSoftwareRenderer: @NO}];
+    });
+
+    [g_ciContext render:transformedImage
+        toCVPixelBuffer:newPixelBuffer
+                 bounds:extent
+             colorSpace:NULL];
+
+    // 创建新的 CMSampleBuffer
+    CMSampleTimingInfo timing = {0};
+    CMSampleBufferGetSampleTimingInfo(originalBuffer, 0, &timing);
+
+    CMVideoFormatDescriptionRef videoInfo = nil;
+    CMVideoFormatDescriptionCreateForImageBuffer(kCFAllocatorDefault, newPixelBuffer, &videoInfo);
+
+    CMSampleBufferRef newBuffer = nil;
+    CMSampleBufferCreateForImageBuffer(kCFAllocatorDefault, newPixelBuffer, true,
+                                        nil, nil, videoInfo, &timing, &newBuffer);
+
+    CFRelease(videoInfo);
+    CVPixelBufferRelease(newPixelBuffer);
+
+    if (newBuffer) {
+        return newBuffer;
+    }
+    CFRetain(originalBuffer);
+    return originalBuffer;
 }
 
 + (UIWindow*)getKeyWindow {
@@ -334,7 +228,6 @@ static OSStatus AudioUnitRender_hook(
 }
 @end
 
-// ========== 视频 Hook ==========
 CALayer *g_maskLayer = nil;
 
 %hook AVCaptureVideoPreviewLayer
@@ -364,7 +257,8 @@ CALayer *g_maskLayer = nil;
         if (g_maskLayer) g_maskLayer.opacity = 1;
         if (g_previewLayer) {
             g_previewLayer.opacity = 1;
-            [g_previewLayer setVideoGravity:[self videoGravity]];
+            // 使用 AspectFill 避免视频拉伸变形
+            [g_previewLayer setVideoGravity:AVLayerVideoGravityResizeAspectFill];
         }
     } else {
         if (g_maskLayer) g_maskLayer.opacity = 0;
@@ -613,7 +507,6 @@ CALayer *g_maskLayer = nil;
 }
 %end
 
-// ========== 初始化 ==========
 %ctor {
     g_isMirroredMark = [NSString stringWithUTF8String:jbroot("/var/mobile/Library/Caches/vcam_is_mirrored_mark")];
     g_tempFile = [NSString stringWithUTF8String:jbroot("/var/mobile/Library/Caches/temp.mov")];
@@ -621,13 +514,8 @@ CALayer *g_maskLayer = nil;
     if ([[NSProcessInfo processInfo] isOperatingSystemAtLeastVersion:(NSOperatingSystemVersion){15, 0, 0}]) g_isIOS15OrLater = YES;
     g_fileManager = [NSFileManager defaultManager];
 
-    updatePreferences();
-
-    CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), NULL, prefsChanged, CFSTR("com.trizau.sileo.vcam.prefschanged"), NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
-
-    MSHookFunction((void *)AudioUnitRender, (void *)AudioUnitRender_hook, (void **)&AudioUnitRender_orig);
-
-    NSLog(@"[VCAM] AudioUnitRender Hook 已安装");
+    // 创建 CIContext（用于视频方向校正）
+    g_ciContext = [CIContext contextWithOptions:@{kCIContextUseSoftwareRenderer: @NO}];
 }
 
 %dtor {
@@ -637,11 +525,5 @@ CALayer *g_maskLayer = nil;
     g_previewLayer = nil;
     g_refreshPreviewByVideoDataOutputTime = 0;
     g_cameraRunning = NO;
-    if (g_audioRingBuffer) {
-        free(g_audioRingBuffer);
-        g_audioRingBuffer = NULL;
-    }
-    g_audioReader = nil;
-    g_audioReplacementOutput = nil;
-    g_audioInjectionReady = NO;
+    g_ciContext = nil;
 }
