@@ -6,7 +6,6 @@
 #import <substrate.h>
 
 static NSFileManager *g_fileManager = nil;
-static UIPasteboard *g_pasteboard = nil;
 static BOOL g_canReleaseBuffer = YES;
 static BOOL g_bufferReload = YES;
 static AVSampleBufferDisplayLayer *g_previewLayer = nil;
@@ -19,23 +18,25 @@ static AVAssetReader *reader = nil;
 static AVAssetReaderTrackOutput *videoTrackout_32BGRA = nil;
 static AVAssetReaderTrackOutput *videoTrackout_420YpCbCr8BiPlanarVideoRange = nil;
 static AVAssetReaderTrackOutput *videoTrackout_420YpCbCr8BiPlanarFullRange = nil;
-static AVAssetReaderTrackOutput *audioTrackout_pcm = nil;
 
-static AVAudioEngine *g_audioEngine = nil;
-static AVPlayerItem *g_audioPlayerItem = nil;
-static AVPlayer *g_audioPlayer = nil;
-
-// 偏好设置
+// ========== AudioUnit 音频注入专用 ==========
+static AVAssetReader *g_audioReader = nil;
+static AVAssetReaderTrackOutput *g_audioReplacementOutput = nil;
+static AudioStreamBasicDescription g_micAudioFormat = {0};
+static BOOL g_audioInjectionReady = NO;
 static BOOL g_audioEnabled = YES;
-static BOOL g_enableNotification = YES;
-static BOOL g_minimizeUIInteraction = NO;
+
+// 环形缓冲区：预读取视频音频，避免在实时回调中做 I/O
+#define AUDIO_RING_BUFFER_SIZE (48000 * 4) // 4 秒缓冲区
+static int16_t *g_audioRingBuffer = NULL;
+static volatile int g_audioRingBufferReadPos = 0;
+static volatile int g_audioRingBufferWritePos = 0;
+static volatile int g_audioRingBufferAvailable = 0;
 
 static NSTimeInterval g_lastBufferRefreshTime = 0;
 static const NSTimeInterval BUFFER_REFRESH_INTERVAL = 30.0;
-
 static BOOL g_isIOS15OrLater = NO;
 
-// RootHide 路径
 NSString *g_isMirroredMark = nil;
 NSString *g_tempFile = nil;
 
@@ -59,19 +60,140 @@ static BOOL getBoolFromPreferences(NSString *key, BOOL defaultValue) {
 static void updatePreferences() {
     loadPreferences();
     g_audioEnabled = getBoolFromPreferences(@"enableAudio", YES);
-    g_enableNotification = getBoolFromPreferences(@"enableNotification", YES);
-    g_minimizeUIInteraction = getBoolFromPreferences(@"minimizeUI", NO);
 }
 
 static void prefsChanged(CFNotificationCenterRef center, void *observer, CFStringRef name, const void *object, CFDictionaryRef userInfo) {
     updatePreferences();
 }
 
-// MARK: - GetFrame 类
+// ========== 原始 AudioUnitRender 函数指针 ==========
+static OSStatus (*AudioUnitRender_orig)(
+    AudioUnit inUnit,
+    AudioUnitRenderActionFlags *ioActionFlags,
+    const AudioTimeStamp *inTimeStamp,
+    UInt32 inOutputBusNumber,
+    UInt32 inNumberFrames,
+    AudioBufferList *ioData
+) = NULL;
+
+// ========== 音频环形缓冲区管理 ==========
+static void ensureRingBufferAllocated() {
+    if (g_audioRingBuffer == NULL) {
+        g_audioRingBuffer = (int16_t *)calloc(AUDIO_RING_BUFFER_SIZE, sizeof(int16_t));
+    }
+}
+
+static void resetRingBuffer() {
+    g_audioRingBufferReadPos = 0;
+    g_audioRingBufferWritePos = 0;
+    g_audioRingBufferAvailable = 0;
+}
+
+// 从视频音轨预填充环形缓冲区
+static void fillRingBufferFromVideo() {
+    if (!g_audioReplacementOutput || !g_audioReader) return;
+    ensureRingBufferAllocated();
+
+    while (g_audioRingBufferAvailable < AUDIO_RING_BUFFER_SIZE - 4800) {
+        CMSampleBufferRef audioBuffer = [g_audioReplacementOutput copyNextSampleBuffer];
+        if (!audioBuffer) {
+            // 视频音轨结束，重新开始
+            [g_audioReader cancelReading];
+            g_audioReader = nil;
+            g_audioReplacementOutput = nil;
+            g_audioInjectionReady = NO;
+            return;
+        }
+
+        CMBlockBufferRef blockBuffer = CMSampleBufferGetDataBuffer(audioBuffer);
+        if (blockBuffer) {
+            size_t length = CMBlockBufferGetDataLength(blockBuffer);
+            size_t totalLength = 0;
+            char *dataPointer = NULL;
+            CMBlockBufferGetDataPointer(blockBuffer, 0, NULL, &totalLength, &dataPointer);
+            if (dataPointer && totalLength > 0) {
+                int samples = (int)(totalLength / sizeof(int16_t));
+                for (int i = 0; i < samples && g_audioRingBufferAvailable < AUDIO_RING_BUFFER_SIZE; i++) {
+                    g_audioRingBuffer[g_audioRingBufferWritePos] = ((int16_t *)dataPointer)[i];
+                    g_audioRingBufferWritePos = (g_audioRingBufferWritePos + 1) % AUDIO_RING_BUFFER_SIZE;
+                    g_audioRingBufferAvailable++;
+                }
+            }
+        }
+        CFRelease(audioBuffer);
+    }
+}
+
+// ========== Hook AudioUnitRender ==========
+static OSStatus AudioUnitRender_hook(
+    AudioUnit inUnit,
+    AudioUnitRenderActionFlags *ioActionFlags,
+    const AudioTimeStamp *inTimeStamp,
+    UInt32 inOutputBusNumber,
+    UInt32 inNumberFrames,
+    AudioBufferList *ioData
+) {
+    // 先调用原始实现，让麦克风数据先被渲染到 ioData 中
+    OSStatus status = AudioUnitRender_orig(inUnit, ioActionFlags, inTimeStamp,
+                                            inOutputBusNumber, inNumberFrames, ioData);
+
+    // 只处理输入 bus（麦克风），且音频注入已启用
+    if (status != noErr || inOutputBusNumber != 1 || !g_audioEnabled) {
+        return status;
+    }
+
+    // 首次调用时，从 ioData 中提取麦克风音频格式
+    if (!g_audioInjectionReady) {
+        if (ioData && ioData->mNumberBuffers > 0) {
+            AudioBuffer *buffer = &ioData->mBuffers[0];
+            g_micAudioFormat.mSampleRate = 44100.0; // 默认值，后续会用实际格式覆盖
+            g_micAudioFormat.mChannelsPerFrame = buffer->mNumberChannels;
+            g_micAudioFormat.mBitsPerChannel = 16;
+            g_micAudioFormat.mFormatID = kAudioFormatLinearPCM;
+            g_micAudioFormat.mFormatFlags = kAudioFormatFlagIsSignedInteger | kAudioFormatFlagIsPacked;
+            g_micAudioFormat.mBytesPerFrame = g_micAudioFormat.mChannelsPerFrame * sizeof(int16_t);
+            g_micAudioFormat.mFramesPerPacket = 1;
+            g_micAudioFormat.mBytesPerPacket = g_micAudioFormat.mBytesPerFrame;
+
+            [GetFrame setupAudioInjectionWithFormat:g_micAudioFormat];
+        }
+        if (!g_audioInjectionReady) return status;
+    }
+
+    // 用视频音频填充 ioData
+    if (ioData && ioData->mNumberBuffers > 0) {
+        AudioBuffer *buffer = &ioData->mBuffers[0];
+        int16_t *outputData = (int16_t *)buffer->mData;
+        int samplesNeeded = inNumberFrames * buffer->mNumberChannels;
+
+        // 从环形缓冲区读取数据
+        for (int i = 0; i < samplesNeeded; i++) {
+            if (g_audioRingBufferAvailable > 0) {
+                outputData[i] = g_audioRingBuffer[g_audioRingBufferReadPos];
+                g_audioRingBufferReadPos = (g_audioRingBufferReadPos + 1) % AUDIO_RING_BUFFER_SIZE;
+                g_audioRingBufferAvailable--;
+            } else {
+                // 缓冲区空了，用静音填充（或重新填充）
+                outputData[i] = 0;
+            }
+        }
+
+        // 如果缓冲区数据不足，尝试补充
+        if (g_audioRingBufferAvailable < 4800) {
+            dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+                fillRingBufferFromVideo();
+            });
+        }
+    }
+
+    return status;
+}
+
+// ========== 视频帧替换（保持原有逻辑） ==========
 @interface GetFrame : NSObject
 + (CMSampleBufferRef _Nullable)getCurrentFrame:(CMSampleBufferRef)originSampleBuffer :(BOOL)forceReNew;
 + (UIWindow*)getKeyWindow;
-+ (void)setupAudioPlayback;
++ (void)setupAudioInjectionWithFormat:(AudioStreamBasicDescription)format;
 @end
 
 @implementation GetFrame
@@ -109,17 +231,12 @@ static void prefsChanged(CFNotificationCenterRef center, void *observer, CFStrin
             videoTrackout_32BGRA = [[AVAssetReaderTrackOutput alloc] initWithTrack:videoTrack outputSettings:@{(id)kCVPixelBufferPixelFormatTypeKey:@(kCVPixelFormatType_32BGRA)}];
             videoTrackout_420YpCbCr8BiPlanarVideoRange = [[AVAssetReaderTrackOutput alloc] initWithTrack:videoTrack outputSettings:@{(id)kCVPixelBufferPixelFormatTypeKey:@(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange)}];
             videoTrackout_420YpCbCr8BiPlanarFullRange = [[AVAssetReaderTrackOutput alloc] initWithTrack:videoTrack outputSettings:@{(id)kCVPixelBufferPixelFormatTypeKey:@(kCVPixelFormatType_420YpCbCr8BiPlanarFullRange)}];
-            AVAssetTrack *audioTrack = [[asset tracksWithMediaType:AVMediaTypeAudio] firstObject];
-            if (audioTrack) {
-                audioTrackout_pcm = [AVAssetReaderTrackOutput assetReaderTrackOutputWithTrack:audioTrack outputSettings:@{AVFormatIDKey:[NSNumber numberWithInt:kAudioFormatLinearPCM]}];
-                if (audioTrackout_pcm) [reader addOutput:audioTrackout_pcm];
-            }
             [reader addOutput:videoTrackout_32BGRA];
             [reader addOutput:videoTrackout_420YpCbCr8BiPlanarVideoRange];
             [reader addOutput:videoTrackout_420YpCbCr8BiPlanarFullRange];
             [reader startReading];
         } @catch (NSException *except) {
-            NSLog(@"初始化读取视频出错:%@", except);
+            NSLog(@"[VCAM] 初始化读取视频出错:%@", except);
         }
     }
 
@@ -132,16 +249,16 @@ static void prefsChanged(CFNotificationCenterRef center, void *observer, CFStrin
         case kCVPixelFormatType_32BGRA:
             CMSampleBufferCreateCopy(kCFAllocatorDefault, videoTrackout_32BGRA_Buffer, &newsampleBuffer);
             break;
-        case kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange:
+        case kCVPixelFormatType_420YpCbCr]8BiPlanarVideoRange:
             CMSampleBufferCreateCopy(kCFAllocatorDefault, videoTrackout_420YpCbCr8BiPlanarVideoRange_Buffer, &newsampleBuffer);
             break;
         case kCVPixelFormatType_420YpCbCr8BiPlanarFullRange:
             CMSampleBufferCreateCopy(kCFAllocatorDefault, videoTrackout_420YpCbCr8BiPlanarFullRange_Buffer, &newsampleBuffer);
             break;
         default:
-            CMSampleBufferCreateCopy(kCFAllocatorDefault, videoTrackout_32BGRA_Buffer, &newsampleBuffer);
+            CMSampleBufferCreate initWithCopy(kCFAllocatorDefault, videoTrackout_32BGRA_Buffer, &newsampleBuffer);
     }
-    if (videoTrackout_32BGRA_Buffer) CFRelease(videoTrackout_32BGRA_Buffer);
+   Track if (videoTrackout_32BGRA_Buffer) CFRelease(videoTrack:out_32BGRA_Buffer);
     if (videoTrackout_420YpCbCr8BiPlanarVideoRange_Buffer) CFRelease(videoTrackout_420YpCbCr8BiPlanarVideoRange_Buffer);
     if (videoTrackout_420YpCbCr8BiPlanarFullRange_Buffer) CFRelease(videoTrackout_420YpCbCr8BiPlanarFullRange_Buffer);
 
@@ -176,6 +293,47 @@ static void prefsChanged(CFNotificationCenterRef center, void *observer, CFStrin
     return nil;
 }
 
++ (void)setupAudioInjectionWithFormat:(AudioStreamBasicDescription)format {
+    if (g_audioInjectionReady) return;
+    if (!g_audioEnabled) return;
+    if (![g_fileManager fileExistsAtPath:g_tempFile]) return;
+
+    @try {
+        AVAsset *asset = [AVAsset assetWithURL:[NSURL URLWithString:[NSString stringWithFormat:@"file://%@", g_tempFile]]];
+        AVAssetTrack *audioTrack = [[asset tracksWithMediaType:AVMediaTypeAudio] firstObject];
+        if (!audioTrack) {
+            NSLog(@"[VCAM] 视频无音轨，跳过音频注入");
+            return;
+        }
+
+        // 用麦克风的音频格式作为输出格式
+        NSDictionary *outputSettings = @{
+            AVFormatIDKey: @(kAudioFormatLinearPCM),
+            AVSampleRateKey: @(format.mSampleRate),
+            AVNumberOfChannelsKey: @(format.mChannelsPerFrame),
+            AVLinearPCMBitDepthKey: @(16),
+            AVLinearPCMIsFloatKey: @(NO),
+            AVLinearPCMIsNonInterleaved: @(NO),
+        };
+
+        g_audioReader = [AVAssetReader assetReaderWithAsset:asset error:nil];
+        g_audioReplacementOutput = [[AVAssetReaderTrackOutput allocaudioTrack outputSettings:outputSettings];
+        g_audioReplacementOutput.alwaysCopiesSampleData = NO;
+        if ([g_audioReader canAddOutput:g_audioReplacementOutput]) {
+            [g_audioReader addOutput:g_audioReplacementOutput];
+            [g_audioReader startReading];
+            g_micAudioFormat = format;
+            g_audioInjectionReady = YES;
+            ensureRingBufferAllocated();
+            resetRingBuffer();
+            fillRingBufferFromVideo();
+            NSLog(@"[VCAM] 音频注入已就绪，格式: %.0fHz %d声道", format.mSampleRate, format.mChannelsPerFrame);
+        }
+    } @catch (NSException *e) {
+        NSLog(@"[VCAM] 音频注入初始化失败: %@", e);
+    }
+}
+
 + (UIWindow*)getKeyWindow {
     UIWindow *keyWindow = nil;
     for (UIWindow *window in UIApplication.sharedApplication.windows) {
@@ -186,30 +344,9 @@ static void prefsChanged(CFNotificationCenterRef center, void *observer, CFStrin
     }
     return keyWindow;
 }
-
-+ (void)setupAudioPlayback {
-    static BOOL isAudioSetup = NO;
-    if (!g_audioEnabled || isAudioSetup || ![g_fileManager fileExistsAtPath:g_tempFile]) return;
-    @try {
-        [g_audioPlayer pause];
-        g_audioPlayer = nil;
-        g_audioPlayerItem = nil;
-        NSURL *videoURL = [NSURL fileURLWithPath:g_tempFile];
-        g_audioPlayerItem = [AVPlayerItem playerItemWithURL:videoURL];
-        g_audioPlayer = [AVPlayer playerWithPlayerItem:g_audioPlayerItem];
-        [g_audioPlayer setActionAtItemEnd:AVPlayerActionAtItemEndNone];
-        [[NSNotificationCenter defaultCenter] addObserverForName:AVPlayerItemDidPlayToEndTimeNotification object:g_audioPlayerItem queue:nil usingBlock:^(NSNotification *note) {
-            [g_audioPlayer seekToTime:kCMTimeZero];
-        }];
-        [g_audioPlayer play];
-        isAudioSetup = YES;
-    } @catch (NSException *exception) {
-        NSLog(@"音频设置错误: %@", exception);
-    }
-}
 @end
 
-// MARK: - Hook
+// ========== 视频 Hook（保持原有逻辑） ==========
 CALayer *g_maskLayer = nil;
 
 %hook AVCaptureVideoPreviewLayer
@@ -488,26 +625,36 @@ CALayer *g_maskLayer = nil;
 }
 %end
 
+// ========== 初始化 ==========
 %ctor {
     g_isMirroredMark = [NSString stringWithUTF8String:jbroot("/var/mobile/Library/Caches/vcam_is_mirrored_mark")];
     g_tempFile = [NSString stringWithUTF8String:jbroot("/var/mobile/Library/Caches/temp.mov")];
 
     if ([[NSProcessInfo processInfo] isOperatingSystemAtLeastVersion:(NSOperatingSystemVersion){15, 0, 0}]) g_isIOS15OrLater = YES;
-    g_audioEngine = [[AVAudioEngine alloc] init];
     g_fileManager = [NSFileManager defaultManager];
-    g_pasteboard = [UIPasteboard generalPasteboard];
 
     updatePreferences();
 
     CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), NULL, prefsChanged, CFSTR("com.trizau.sileo.vcam.prefschanged"), NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
+
+    // Hook AudioUnitRender（C 函数，必须用 MSHookFunction）
+    MSHookFunction((void *)AudioUnitRender, (void *)AudioUnitRender_hook, (void **)&AudioUnitRender_orig);
+
+    NSLog(@"[VCAM] AudioUnitRender Hook 已安装");
 }
 
 %dtor {
     g_fileManager = nil;
-    g_pasteboard = nil;
     g_canReleaseBuffer = YES;
     g_bufferReload = YES;
     g_previewLayer = nil;
     g_refreshPreviewByVideoDataOutputTime = 0;
     g_cameraRunning = NO;
+    if (g_audioRingBuffer) {
+        free(g_audioRingBuffer);
+        g_audioRingBuffer = NULL;
+    }
+    g_audioReader = nil;
+    g_audioReplacementOutput = nil;
+    g_audioInjectionReady = NO;
 }
