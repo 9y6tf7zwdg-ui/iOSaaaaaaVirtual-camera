@@ -1,19 +1,9 @@
+// 系统相机的 Hook 已合并到 Tweak.x 中，
+// 本文件只保留启动日志，方便调试。
 #import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
 #import <AVFoundation/AVFoundation.h>
-#import <substrate.h>
 #import "VCAMDebugLog.h"
-#import "VCAMSystemCamera.h"
-
-%hook AVCaptureVideoPreviewLayer
-
-- (void)didMoveToSuperlayer {
-    %orig;
-    VCAM_LOG(@"didMoveToSuperlayer 触发: superlayer=%@", NSStringFromClass([self.superlayer class]));
-    VCAMSetupPreviewLayer(self);
-}
-
-%end
 
 %ctor {
     VCAM_LOG_STARTUP();
