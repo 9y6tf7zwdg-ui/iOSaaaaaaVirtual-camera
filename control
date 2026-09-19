@@ -1,9 +1,9 @@
 Package: com.trizau.sileo.vcam
 Name: VCAM - Virtual Camera
-Version: 1.0.0
+Version: 1.2.2
 Architecture: iphoneos-arm64e
 Description: Replace camera with custom video, support audio and iOS 15+
-Maintainer: trizau
-Author: trizau
+Maintainer: wubinlin
+Author: wubinlin
 Section: Tweaks
 Depends: mobilesubstrate
