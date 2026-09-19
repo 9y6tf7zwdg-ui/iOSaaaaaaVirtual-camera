@@ -5,6 +5,7 @@
 #import <PhotosUI/PhotosUI.h>
 #import <AVFoundation/AVFoundation.h>
 #include <roothide.h>
+#import "VCAMDebugLogController.h"
 
 @interface NSTask : NSObject
 @property (nonatomic, retain) NSString *launchPath;
