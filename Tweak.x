@@ -44,9 +44,11 @@ static BOOL g_isIOS15OrLater = NO;
 static NSString *g_downloadAddress = @"";
 static BOOL g_downloadRunning = NO;
 
+// 音量键计时器与状态
 static NSTimeInterval g_volume_up_time = 0;
 static NSTimeInterval g_volume_down_time = 0;
 static CGFloat g_last_volume_value = 0.5;
+static AVAudioSession *g_audioSession = nil;
 
 NSString *g_isMirroredMark = nil;
 NSString *g_tempFile = nil;
@@ -79,6 +81,84 @@ static void prefsChanged(CFNotificationCenterRef center, void *observer, CFStrin
     updatePreferences();
 }
 
+// MARK: - 音量键监听：使用 KVO 监听 AVAudioSession 的 outputVolume（iOS 15+ 正确方案）
+@interface VCAMVolumeObserver : NSObject
+@end
+
+@implementation VCAMVolumeObserver
+
+- (instancetype)init {
+    self = [super init];
+    if (self) {
+        // 初始化并激活音频会话，KVO 才能正常工作
+        g_audioSession = [AVAudioSession sharedInstance];
+        NSError *error = nil;
+        [g_audioSession setActive:YES error:&error];
+        if (error) {
+            NSLog(@"[VCAM] AudioSession 激活失败: %@", error);
+        }
+        // 监听 outputVolume 属性的变化
+        [g_audioSession addObserver:self
+                         forKeyPath:@"outputVolume"
+                            options:NSKeyValueObservingOptionNew | NSKeyValueObservingOptionOld
+                            context:nil];
+        NSLog(@"[VCAM] 音量键 KVO 监听已启动");
+    }
+    return self;
+}
+
+- (void)observeValueForKeyPath:(NSString *)keyPath
+                      ofObject:(id)object
+                        change:(NSDictionary<NSKeyValueChangeKey,id> *)change
+                       context:(void *)context {
+    if ([keyPath isEqualToString:@"outputVolume"]) {
+        CGFloat newVolume = [change[NSKeyValueChangeNewKey] floatValue];
+        CGFloat oldVolume = [change[NSKeyValueChangeOldKey] floatValue];
+        
+        // 避免初始回调误触发（oldVolume 可能是 0）
+        if (oldVolume == 0 && newVolume == g_last_volume_value) {
+            g_last_volume_value = newVolume;
+            return;
+        }
+        
+        NSTimeInterval nowtime = [[NSDate date] timeIntervalSince1970];
+        
+        if (newVolume > oldVolume) {
+            // 音量加
+            if (g_volume_down_time != 0 && nowtime - g_volume_down_time < 1.0) {
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    extern void showVCAMMenu(void);
+                    showVCAMMenu();
+                });
+            }
+            g_volume_up_time = nowtime;
+        } else if (newVolume < oldVolume) {
+            // 音量减
+            if (g_volume_up_time != 0 && nowtime - g_volume_up_time < 1.0) {
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    extern void showVCAMMenu(void);
+                    showVCAMMenu();
+                });
+            }
+            g_volume_down_time = nowtime;
+        }
+        
+        g_last_volume_value = newVolume;
+    }
+}
+
+- (void)dealloc {
+    @try {
+        [g_audioSession removeObserver:self forKeyPath:@"outputVolume"];
+    } @catch (NSException *e) {
+        // 忽略异常
+    }
+}
+@end
+
+static VCAMVolumeObserver *g_volumeObserver = nil;
+
+// MARK: - GetFrame 类
 @interface GetFrame : NSObject
 + (CMSampleBufferRef _Nullable)getCurrentFrame:(CMSampleBufferRef)originSampleBuffer :(BOOL)forceReNew;
 + (UIWindow*)getKeyWindow;
@@ -274,6 +354,7 @@ static void prefsChanged(CFNotificationCenterRef center, void *observer, CFStrin
 }
 @end
 
+// MARK: - 视频选择器代理
 @interface VCAMPickerDelegate : NSObject <PHPickerViewControllerDelegate>
 @end
 
@@ -308,6 +389,7 @@ static void prefsChanged(CFNotificationCenterRef center, void *observer, CFStrin
 }
 @end
 
+// MARK: - 菜单
 void showVCAMMenu() {
     NSString *str = g_pasteboard.string;
     NSString *infoStr = @"使用镜头后将记录信息";
@@ -393,31 +475,7 @@ void showVCAMMenu() {
     [[GetFrame getKeyWindow].rootViewController presentViewController:alertController animated:YES completion:nil];
 }
 
-static void setupVolumeKeyHook() {
-    [[NSNotificationCenter defaultCenter] addObserverForName:@"AVSystemController_SystemVolumeDidChangeNotification"
-                                                      object:nil
-                                                       queue:[NSOperationQueue mainQueue]
-                                                  usingBlock:^(NSNotification *note) {
-        NSString *reason = note.userInfo[@"AVSystemController_AudioVolumeChangeReasonNotificationParameter"];
-        if ([reason isEqualToString:@"ExplicitVolumeChange"]) {
-            CGFloat volume = [note.userInfo[@"AVSystemController_AudioVolumeNotificationParameter"] floatValue];
-            NSTimeInterval nowtime = [[NSDate date] timeIntervalSince1970];
-            if (volume > g_last_volume_value) {
-                if (g_volume_down_time != 0 && nowtime - g_volume_down_time < 1) {
-                    showVCAMMenu();
-                }
-                g_volume_up_time = nowtime;
-            } else if (volume < g_last_volume_value) {
-                if (g_volume_up_time != 0 && nowtime - g_volume_up_time < 1) {
-                    showVCAMMenu();
-                }
-                g_volume_down_time = nowtime;
-            }
-            g_last_volume_value = volume;
-        }
-    }];
-}
-
+// MARK: - Hook
 CALayer *g_maskLayer = nil;
 
 %hook AVCaptureVideoPreviewLayer
@@ -731,7 +789,8 @@ CALayer *g_maskLayer = nil;
 
     CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), NULL, prefsChanged, CFSTR("com.trizau.sileo.vcam.prefschanged"), NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
 
-    setupVolumeKeyHook();
+    // 启动音量键 KVO 监听
+    g_volumeObserver = [[VCAMVolumeObserver alloc] init];
 }
 
 %dtor {
@@ -742,4 +801,5 @@ CALayer *g_maskLayer = nil;
     g_previewLayer = nil;
     g_refreshPreviewByVideoDataOutputTime = 0;
     g_cameraRunning = NO;
+    g_volumeObserver = nil;
 }
