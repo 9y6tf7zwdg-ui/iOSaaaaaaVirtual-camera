@@ -185,67 +185,12 @@
     [editor dismissViewControllerAnimated:YES completion:nil];
 }
 
-#pragma mark - 保存视频（强制输出横屏像素数据，与相机采集帧方向一致）
+#pragma mark - 保存视频（不做任何旋转，直接复制原始视频）
 
 - (void)finalizeVideoWithPath:(NSString *)sourcePath {
-    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-        AVAsset *asset = [AVAsset assetWithURL:[NSURL fileURLWithPath:sourcePath]];
-        AVAssetTrack *videoTrack = [[asset tracksWithMediaType:AVMediaTypeVideo] firstObject];
-        if (!videoTrack) {
-            [self copyToTempPath:sourcePath];
-            return;
-        }
-
-        CGSize naturalSize = videoTrack.naturalSize;
-
-        // 相机采集的帧永远是横屏（宽 > 高）。
-        // 如果原始像素数据的宽 < 高，说明它是竖屏录制的，需要旋转 90 度到横屏。
-        CGSize renderSize = naturalSize;
-        if (naturalSize.width < naturalSize.height) {
-            renderSize = CGSizeMake(naturalSize.height, naturalSize.width);
-        }
-
-        AVMutableVideoComposition *videoComposition = [AVMutableVideoComposition videoComposition];
-        videoComposition.renderSize = renderSize;
-        videoComposition.frameDuration = CMTimeMake(1, 30);
-
-        AVMutableVideoCompositionInstruction *instruction = [AVMutableVideoCompositionInstruction videoCompositionInstruction];
-        instruction.timeRange = CMTimeRangeMake(kCMTimeZero, asset.duration);
-
-        AVMutableVideoCompositionLayerInstruction *layerInstruction = [AVMutableVideoCompositionLayerInstruction videoCompositionLayerInstructionWithAssetTrack:videoTrack];
-
-        // 忽略 preferredTransform，强制输出横屏像素数据
-        CGAffineTransform transform = CGAffineTransformIdentity;
-        if (naturalSize.width < naturalSize.height) {
-            // 竖屏像素数据，旋转 90 度到横屏
-            transform = CGAffineTransformConcat(CGAffineTransformMakeRotation(M_PI_2),
-                                                CGAffineTransformMakeTranslation(renderSize.width, 0));
-        }
-
-        [layerInstruction setTransform:transform atTime:kCMTimeZero];
-
-        instruction.layerInstructions = @[layerInstruction];
-        videoComposition.instructions = @[instruction];
-
-        NSString *exportPath = [NSTemporaryDirectory() stringByAppendingPathComponent:@"vcam_oriented.mov"];
-        NSFileManager *fm = [NSFileManager defaultManager];
-        if ([fm fileExistsAtPath:exportPath]) [fm removeItemAtPath:exportPath error:nil];
-
-        AVAssetExportSession *exportSession = [[AVAssetExportSession alloc] initWithAsset:asset presetName:AVAssetExportPresetHighestQuality];
-        exportSession.outputURL = [NSURL fileURLWithPath:exportPath];
-        exportSession.outputFileType = AVFileTypeQuickTimeMovie;
-        exportSession.videoComposition = videoComposition;
-        exportSession.shouldOptimizeForNetworkUse = NO;
-
-        [exportSession exportAsynchronouslyWithCompletionHandler:^{
-            if (exportSession.status == AVAssetExportSessionStatusCompleted) {
-                [self copyToTempPath:exportPath];
-            } else {
-                NSLog(@"[VCAM] 导出失败: %@", exportSession.error);
-                [self copyToTempPath:sourcePath];
-            }
-        }];
-    });
+    // 不做任何旋转/导出，直接复制原始视频到 temp.mov
+    // 让插件在替换帧时动态对齐到相机采集帧的方向
+    [self copyToTempPath:sourcePath];
 }
 
 - (void)copyToTempPath:(NSString *)sourcePath {
