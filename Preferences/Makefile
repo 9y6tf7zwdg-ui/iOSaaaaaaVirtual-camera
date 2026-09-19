@@ -6,4 +6,4 @@ VCAMPrefs_CFLAGS = -fobjc-arc -Wno-error
 VCAMPrefs_INSTALL_PATH = /Library/PreferenceBundles
 
 include $(THEOS)/makefiles/common.mk
-include $(THEOS)/MAKE_PATH/bundle.mk
+include $(THEOS_MAKE_PATH)/bundle.mk
