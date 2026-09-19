@@ -21,8 +21,8 @@ static BOOL g_cameraRunning = NO;
 static NSString *g_cameraPosition = @"B";
 static AVCaptureVideoOrientation g_photoOrientation = AVCaptureVideoOrientationPortrait;
 
-NSString *g_isMirroredMark = @"/var/mobile/Library/Caches/vcam_is_mirrored_mark";
-NSString *g_tempFile = @"/var/mobile/Library/Caches/temp.mov";
+NSString *g_isMirroredMark = @"/var/jb/var/mobile/Library/Caches/vcam_is_mirrored_mark";
+NSString *g_tempFile = @"/var/jb/var/mobile/Library/Caches/temp.mov";
 
 static AVAssetReader *reader = nil;
 static AVAssetReaderTrackOutput *videoTrackout_32BGRA = nil;
