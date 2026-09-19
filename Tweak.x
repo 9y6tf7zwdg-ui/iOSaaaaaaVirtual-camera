@@ -15,14 +15,7 @@ static NSString *g_cameraPosition = @"B";
 static AVCaptureVideoOrientation g_photoOrientation = AVCaptureVideoOrientationPortrait;
 
 static AVAssetReader *reader = nil;
-static AVAssetReaderTrackOutput *videoTrackout_32BGRA = nil;
-static AVAssetReaderTrackOutput *videoTrackout_420YpCbCr8BiPlanarVideoRange = nil;
-static AVAssetReaderTrackOutput *videoTrackout_420YpCbCr8BiPlanarFullRange = nil;
-
-// 视频方向校正（不在声明时初始化，因为 CGAffineTransformIdentity / CGSizeZero 不是编译期常量）
-static CGAffineTransform g_videoPreferredTransform;
-static CGSize g_videoNaturalSize;
-static CIContext *g_ciContext = nil;
+static AVAssetReaderVideoCompositionOutput *videoTrackout = nil;
 
 static NSTimeInterval g_lastBufferRefreshTime = 0;
 static const NSTimeInterval BUFFER_REFRESH_INTERVAL = 30.0;
@@ -68,146 +61,78 @@ NSString *g_tempFile = nil;
             AVAsset *asset = [AVAsset assetWithURL:[NSURL URLWithString:[NSString stringWithFormat:@"file://%@", g_tempFile]]];
             reader = [AVAssetReader assetReaderWithAsset:asset error:nil];
             AVAssetTrack *videoTrack = [[asset tracksWithMediaType:AVMediaTypeVideo] firstObject];
+            if (!videoTrack) {
+                NSLog(@"[VCAM] 视频没有视频轨");
+                return nil;
+            }
 
-            g_videoPreferredTransform = videoTrack.preferredTransform;
-            g_videoNaturalSize = videoTrack.naturalSize;
+            // ⭐ 核心：使用 AVAssetReaderVideoCompositionOutput，让系统自动处理视频方向
+            AVMutableVideoComposition *videoComposition = [AVMutableVideoComposition videoCompositionWithPropertiesOfAsset:asset];
+            // 保证帧率合适，避免过高帧率导致性能问题
+            videoComposition.frameDuration = CMTimeMake(1, 30);
 
-            videoTrackout_32BGRA = [[AVAssetReaderTrackOutput alloc] initWithTrack:videoTrack outputSettings:@{(id)kCVPixelBufferPixelFormatTypeKey:@(kCVPixelFormatType_32BGRA)}];
-            videoTrackout_420YpCbCr8BiPlanarVideoRange = [[AVAssetReaderTrackOutput alloc] initWithTrack:videoTrack outputSettings:@{(id)kCVPixelBufferPixelFormatTypeKey:@(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange)}];
-            videoTrackout_420YpCbCr8BiPlanarFullRange = [[AVAssetReaderTrackOutput alloc] initWithTrack:videoTrack outputSettings:@{(id)kCVPixelBufferPixelFormatTypeKey:@(kCVPixelFormatType_420YpCbCr8BiPlanarFullRange)}];
-            [reader addOutput:videoTrackout_32BGRA];
-            [reader addOutput:videoTrackout_420YpCbCr8BiPlanarVideoRange];
-            [reader addOutput:videoTrackout_420YpCbCr8BiPlanarFullRange];
-            [reader startReading];
+            NSDictionary *outputSettings = @{
+                (id)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_32BGRA),
+                (id)kCVPixelBufferIOSurfacePropertiesKey: @{},
+            };
+
+            videoTrackout = [[AVAssetReaderVideoCompositionOutput alloc] initWithVideoTracks:@[videoTrack]
+                                                                               videoSettings:outputSettings];
+            videoTrackout.videoComposition = videoComposition;
+            videoTrackout.alwaysCopiesSampleData = NO;
+
+            if ([reader canAddOutput:videoTrackout]) {
+                [reader addOutput:videoTrackout];
+                [reader startReading];
+            } else {
+                NSLog(@"[VCAM] 无法添加 videoCompositionOutput");
+                return nil;
+            }
         } @catch (NSException *except) {
             NSLog(@"[VCAM] 初始化读取视频出错:%@", except);
         }
     }
 
-    CMSampleBufferRef videoTrackout_32BGRA_Buffer = [videoTrackout_32BGRA copyNextSampleBuffer];
-    CMSampleBufferRef videoTrackout_420YpCbCr8BiPlanarVideoRange_Buffer = [videoTrackout_420YpCbCr8BiPlanarVideoRange copyNextSampleBuffer];
-    CMSampleBufferRef videoTrackout_420YpCbCr8BiPlanarFullRange_Buffer = [videoTrackout_420YpCbCr8BiPlanarFullRange copyNextSampleBuffer];
-
-    CMSampleBufferRef newsampleBuffer = nil;
-    switch(subMediaType) {
-        case kCVPixelFormatType_32BGRA:
-            CMSampleBufferCreateCopy(kCFAllocatorDefault, videoTrackout_32BGRA_Buffer, &newsampleBuffer);
-            break;
-        case kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange:
-            CMSampleBufferCreateCopy(kCFAllocatorDefault, videoTrackout_420YpCbCr8BiPlanarVideoRange_Buffer, &newsampleBuffer);
-            break;
-        case kCVPixelFormatType_420YpCbCr8BiPlanarFullRange:
-            CMSampleBufferCreateCopy(kCFAllocatorDefault, videoTrackout_420YpCbCr8BiPlanarFullRange_Buffer, &newsampleBuffer);
-            break;
-        default:
-            CMSampleBufferCreateCopy(kCFAllocatorDefault, videoTrackout_32BGRA_Buffer, &newsampleBuffer);
-    }
-    if (videoTrackout_32BGRA_Buffer) CFRelease(videoTrackout_32BGRA_Buffer);
-    if (videoTrackout_420YpCbCr8BiPlanarVideoRange_Buffer) CFRelease(videoTrackout_420YpCbCr8BiPlanarVideoRange_Buffer);
-    if (videoTrackout_420YpCbCr8BiPlanarFullRange_Buffer) CFRelease(videoTrackout_420YpCbCr8BiPlanarFullRange_Buffer);
+    CMSampleBufferRef newsampleBuffer = [videoTrackout copyNextSampleBuffer];
 
     if (newsampleBuffer == nil) {
         g_bufferReload = YES;
-    } else {
-        if (sampleBuffer) CFRelease(sampleBuffer);
-
-        CMSampleBufferRef orientedBuffer = [self applyOrientation:newsampleBuffer];
-
-        if (originSampleBuffer != nil) {
-            CMSampleBufferRef copyBuffer = nil;
-            CVImageBufferRef pixelBuffer = CMSampleBufferGetImageBuffer(orientedBuffer);
-            CMSampleTimingInfo sampleTime = {
-                .duration = CMSampleBufferGetDuration(originSampleBuffer),
-                .presentationTimeStamp = CMSampleBufferGetPresentationTimeStamp(originSampleBuffer),
-                .decodeTimeStamp = CMSampleBufferGetDecodeTimeStamp(originSampleBuffer)
-            };
-            CMVideoFormatDescriptionRef videoInfo = nil;
-            CMVideoFormatDescriptionCreateForImageBuffer(kCFAllocatorDefault, pixelBuffer, &videoInfo);
-            CMSampleBufferCreateForImageBuffer(kCFAllocatorDefault, pixelBuffer, true, nil, nil, videoInfo, &sampleTime, &copyBuffer);
-            if (copyBuffer) {
-                CFDictionaryRef exifAttachments = CMGetAttachment(originSampleBuffer, (CFStringRef)@"{Exif}", NULL);
-                CFDictionaryRef TIFFAttachments = CMGetAttachment(originSampleBuffer, (CFStringRef)@"{TIFF}", NULL);
-                if (exifAttachments) CMSetAttachment(copyBuffer, (CFStringRef)@"{Exif}", exifAttachments, kCMAttachmentMode_ShouldPropagate);
-                if (exifAttachments) CMSetAttachment(copyBuffer, (CFStringRef)@"{TIFF}", TIFFAttachments, kCMAttachmentMode_ShouldPropagate);
-                sampleBuffer = copyBuffer;
-            }
-            if (orientedBuffer && orientedBuffer != newsampleBuffer) CFRelease(orientedBuffer);
-            CFRelease(newsampleBuffer);
-        } else {
-            sampleBuffer = orientedBuffer;
-            if (orientedBuffer != newsampleBuffer) CFRelease(newsampleBuffer);
+        if (sampleBuffer) {
+            CFRelease(sampleBuffer);
+            sampleBuffer = nil;
         }
+        return nil;
     }
-    if (CMSampleBufferIsValid(sampleBuffer)) return sampleBuffer;
+
+    if (sampleBuffer) CFRelease(sampleBuffer);
+
+    if (originSampleBuffer != nil) {
+        CMSampleBufferRef copyBuffer = nil;
+        CVImageBufferRef pixelBuffer = CMSampleBufferGetImageBuffer(newsampleBuffer);
+        CMSampleTimingInfo sampleTime = {
+            .duration = CMSampleBufferGetDuration(originSampleBuffer),
+            .presentationTimeStamp = CMSampleBufferGetPresentationTimeStamp(originSampleBuffer),
+            .decodeTimeStamp = CMSampleBufferGetDecodeTimeStamp(originSampleBuffer)
+        };
+        CMVideoFormatDescriptionRef videoInfo = nil;
+        CMVideoFormatDescriptionCreateForImageBuffer(kCFAllocatorDefault, pixelBuffer, &videoInfo);
+        CMSampleBufferCreateForImageBuffer(kCFAllocatorDefault, pixelBuffer, true, nil, nil, videoInfo, &sampleTime, &copyBuffer);
+        if (videoInfo) CFRelease(videoInfo);
+
+        if (copyBuffer) {
+            CFDictionaryRef exifAttachments = CMGetAttachment(originSampleBuffer, (CFStringRef)@"{Exif}", NULL);
+            CFDictionaryRef TIFFAttachments = CMGetAttachment(originSampleBuffer, (CFStringRef)@"{TIFF}", NULL);
+            if (exifAttachments) CMSetAttachment(copyBuffer, (CFStringRef)@"{Exif}", exifAttachments, kCMAttachmentMode_ShouldPropagate);
+            if (exifAttachments) CMSetAttachment(copyBuffer, (CFStringRef)@"{TIFF}", TIFFAttachments, kCMAttachmentMode_ShouldPropagate);
+            sampleBuffer = copyBuffer;
+        }
+        CFRelease(newsampleBuffer);
+    } else {
+        sampleBuffer = newsampleBuffer;
+    }
+
+    if (sampleBuffer && CMSampleBufferIsValid(sampleBuffer)) return sampleBuffer;
     return nil;
-}
-
-+ (CMSampleBufferRef)applyOrientation:(CMSampleBufferRef)originalBuffer {
-    if (CGAffineTransformIsIdentity(g_videoPreferredTransform)) {
-        CFRetain(originalBuffer);
-        return originalBuffer;
-    }
-
-    CVImageBufferRef pixelBuffer = CMSampleBufferGetImageBuffer(originalBuffer);
-    if (!pixelBuffer) {
-        CFRetain(originalBuffer);
-        return originalBuffer;
-    }
-
-    CIImage *ciImage = [CIImage imageWithCVPixelBuffer:pixelBuffer];
-    CIImage *transformedImage = [ciImage imageByApplyingTransform:g_videoPreferredTransform];
-
-    CGRect extent = transformedImage.extent;
-    size_t width = (size_t)extent.size.width;
-    size_t height = (size_t)extent.size.height;
-
-    if (width == 0 || height == 0) {
-        CFRetain(originalBuffer);
-        return originalBuffer;
-    }
-
-    CVPixelBufferRef newPixelBuffer = NULL;
-    NSDictionary *options = @{
-        (id)kCVPixelBufferCGImageCompatibilityKey: @YES,
-        (id)kCVPixelBufferCGBitmapContextCompatibilityKey: @YES,
-        (id)kCVPixelBufferIOSurfacePropertiesKey: @{}
-    };
-    CVReturn result = CVPixelBufferCreate(kCFAllocatorDefault, width, height,
-                                           kCVPixelFormatType_32BGRA,
-                                           (__bridge CFDictionaryRef)options,
-                                           &newPixelBuffer);
-    if (result != kCVReturnSuccess || newPixelBuffer == NULL) {
-        CFRetain(originalBuffer);
-        return originalBuffer;
-    }
-
-    if (g_ciContext == nil) {
-        g_ciContext = [CIContext contextWithOptions:@{kCIContextUseSoftwareRenderer: @NO}];
-    }
-
-    [g_ciContext render:transformedImage
-        toCVPixelBuffer:newPixelBuffer
-                 bounds:extent
-             colorSpace:NULL];
-
-    CMSampleTimingInfo timing = {0};
-    CMSampleBufferGetSampleTimingInfo(originalBuffer, 0, &timing);
-
-    CMVideoFormatDescriptionRef videoInfo = nil;
-    CMVideoFormatDescriptionCreateForImageBuffer(kCFAllocatorDefault, newPixelBuffer, &videoInfo);
-
-    CMSampleBufferRef newBuffer = nil;
-    CMSampleBufferCreateForImageBuffer(kCFAllocatorDefault, newPixelBuffer, true,
-                                        nil, nil, videoInfo, &timing, &newBuffer);
-
-    CFRelease(videoInfo);
-    CVPixelBufferRelease(newPixelBuffer);
-
-    if (newBuffer) {
-        return newBuffer;
-    }
-    CFRetain(originalBuffer);
-    return originalBuffer;
 }
 
 + (UIWindow*)getKeyWindow {
@@ -251,7 +176,8 @@ CALayer *g_maskLayer = nil;
         if (g_maskLayer) g_maskLayer.opacity = 1;
         if (g_previewLayer) {
             g_previewLayer.opacity = 1;
-            [g_previewLayer setVideoGravity:AVLayerVideoGravityResizeAspectFill];
+            // 使用 AspectFit 完整显示视频，避免裁剪，让用户看到整个视频画面
+            [g_previewLayer setVideoGravity:AVLayerVideoGravityResizeAspect];
         }
     } else {
         if (g_maskLayer) g_maskLayer.opacity = 0;
@@ -501,16 +427,11 @@ CALayer *g_maskLayer = nil;
 %end
 
 %ctor {
-    g_videoPreferredTransform = CGAffineTransformIdentity;
-    g_videoNaturalSize = CGSizeZero;
-
     g_isMirroredMark = [NSString stringWithUTF8String:jbroot("/var/mobile/Library/Caches/vcam_is_mirrored_mark")];
     g_tempFile = [NSString stringWithUTF8String:jbroot("/var/mobile/Library/Caches/temp.mov")];
 
     if ([[NSProcessInfo processInfo] isOperatingSystemAtLeastVersion:(NSOperatingSystemVersion){15, 0, 0}]) g_isIOS15OrLater = YES;
     g_fileManager = [NSFileManager defaultManager];
-
-    g_ciContext = [CIContext contextWithOptions:@{kCIContextUseSoftwareRenderer: @NO}];
 }
 
 %dtor {
@@ -520,5 +441,4 @@ CALayer *g_maskLayer = nil;
     g_previewLayer = nil;
     g_refreshPreviewByVideoDataOutputTime = 0;
     g_cameraRunning = NO;
-    g_ciContext = nil;
 }
