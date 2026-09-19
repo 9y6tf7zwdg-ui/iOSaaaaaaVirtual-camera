@@ -14,12 +14,12 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Theos (RootHide Branch)
+      - name: Setup Theos (RootHide Fork)
         run: |
           brew install ldid dpkg
           export THEOS=$HOME/theos
-          # 关键：克隆 RootHide 专属的 Theos 分支
-          git clone -b roothide --recursive https://github.com/roothide/theos.git $THEOS
+          # 这里修正了！分支名是 master，不是 roothide
+          git clone -b master --recursive https://github.com/roothide/theos.git $THEOS
           echo "THEOS=$THEOS" >> $GITHUB_ENV
           echo "$THEOS/bin" >> $GITHUB_PATH
 
