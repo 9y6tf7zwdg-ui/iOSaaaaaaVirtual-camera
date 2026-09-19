@@ -2,16 +2,8 @@
 #import <Foundation/Foundation.h>
 #import <AVFoundation/AVFoundation.h>
 #import <AudioToolbox/AudioToolbox.h>
-#import <PhotosUI/PhotosUI.h>
 #include <roothide.h>
 #import <substrate.h>
-
-@interface NSTask : NSObject
-@property (nonatomic, retain) NSString *launchPath;
-@property (nonatomic, retain) NSArray *arguments;
-- (void)launch;
-- (void)waitUntilExit;
-@end
 
 static NSFileManager *g_fileManager = nil;
 static UIPasteboard *g_pasteboard = nil;
@@ -33,6 +25,7 @@ static AVAudioEngine *g_audioEngine = nil;
 static AVPlayerItem *g_audioPlayerItem = nil;
 static AVPlayer *g_audioPlayer = nil;
 
+// 偏好设置
 static BOOL g_audioEnabled = YES;
 static BOOL g_enableNotification = YES;
 static BOOL g_minimizeUIInteraction = NO;
@@ -41,15 +34,8 @@ static NSTimeInterval g_lastBufferRefreshTime = 0;
 static const NSTimeInterval BUFFER_REFRESH_INTERVAL = 30.0;
 
 static BOOL g_isIOS15OrLater = NO;
-static NSString *g_downloadAddress = @"";
-static BOOL g_downloadRunning = NO;
 
-// 音量键计时器与状态
-static NSTimeInterval g_volume_up_time = 0;
-static NSTimeInterval g_volume_down_time = 0;
-static CGFloat g_last_volume_value = 0.5;
-static AVAudioSession *g_audioSession = nil;
-
+// RootHide 路径
 NSString *g_isMirroredMark = nil;
 NSString *g_tempFile = nil;
 
@@ -81,90 +67,11 @@ static void prefsChanged(CFNotificationCenterRef center, void *observer, CFStrin
     updatePreferences();
 }
 
-// MARK: - 音量键监听：使用 KVO 监听 AVAudioSession 的 outputVolume（iOS 15+ 正确方案）
-@interface VCAMVolumeObserver : NSObject
-@end
-
-@implementation VCAMVolumeObserver
-
-- (instancetype)init {
-    self = [super init];
-    if (self) {
-        // 初始化并激活音频会话，KVO 才能正常工作
-        g_audioSession = [AVAudioSession sharedInstance];
-        NSError *error = nil;
-        [g_audioSession setActive:YES error:&error];
-        if (error) {
-            NSLog(@"[VCAM] AudioSession 激活失败: %@", error);
-        }
-        // 监听 outputVolume 属性的变化
-        [g_audioSession addObserver:self
-                         forKeyPath:@"outputVolume"
-                            options:NSKeyValueObservingOptionNew | NSKeyValueObservingOptionOld
-                            context:nil];
-        NSLog(@"[VCAM] 音量键 KVO 监听已启动");
-    }
-    return self;
-}
-
-- (void)observeValueForKeyPath:(NSString *)keyPath
-                      ofObject:(id)object
-                        change:(NSDictionary<NSKeyValueChangeKey,id> *)change
-                       context:(void *)context {
-    if ([keyPath isEqualToString:@"outputVolume"]) {
-        CGFloat newVolume = [change[NSKeyValueChangeNewKey] floatValue];
-        CGFloat oldVolume = [change[NSKeyValueChangeOldKey] floatValue];
-        
-        // 避免初始回调误触发（oldVolume 可能是 0）
-        if (oldVolume == 0 && newVolume == g_last_volume_value) {
-            g_last_volume_value = newVolume;
-            return;
-        }
-        
-        NSTimeInterval nowtime = [[NSDate date] timeIntervalSince1970];
-        
-        if (newVolume > oldVolume) {
-            // 音量加
-            if (g_volume_down_time != 0 && nowtime - g_volume_down_time < 1.0) {
-                dispatch_async(dispatch_get_main_queue(), ^{
-                    extern void showVCAMMenu(void);
-                    showVCAMMenu();
-                });
-            }
-            g_volume_up_time = nowtime;
-        } else if (newVolume < oldVolume) {
-            // 音量减
-            if (g_volume_up_time != 0 && nowtime - g_volume_up_time < 1.0) {
-                dispatch_async(dispatch_get_main_queue(), ^{
-                    extern void showVCAMMenu(void);
-                    showVCAMMenu();
-                });
-            }
-            g_volume_down_time = nowtime;
-        }
-        
-        g_last_volume_value = newVolume;
-    }
-}
-
-- (void)dealloc {
-    @try {
-        [g_audioSession removeObserver:self forKeyPath:@"outputVolume"];
-    } @catch (NSException *e) {
-        // 忽略异常
-    }
-}
-@end
-
-static VCAMVolumeObserver *g_volumeObserver = nil;
-
 // MARK: - GetFrame 类
 @interface GetFrame : NSObject
 + (CMSampleBufferRef _Nullable)getCurrentFrame:(CMSampleBufferRef)originSampleBuffer :(BOOL)forceReNew;
 + (UIWindow*)getKeyWindow;
 + (void)setupAudioPlayback;
-+ (void)showMinimalNotification:(NSString *)message;
-+ (void)fixCameraWithLDRestart;
 @end
 
 @implementation GetFrame
@@ -300,180 +207,7 @@ static VCAMVolumeObserver *g_volumeObserver = nil;
         NSLog(@"音频设置错误: %@", exception);
     }
 }
-
-+ (void)showMinimalNotification:(NSString *)message {
-    if (!g_enableNotification) return;
-    dispatch_async(dispatch_get_main_queue(), ^{
-        UIWindow *window = [GetFrame getKeyWindow];
-        if (!window) return;
-        UIView *notificationView = [[UIView alloc] initWithFrame:CGRectMake(0, 44, window.bounds.size.width, 40)];
-        notificationView.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.7];
-        notificationView.layer.cornerRadius = 10;
-        notificationView.clipsToBounds = YES;
-        UILabel *label = [[UILabel alloc] initWithFrame:CGRectMake(10, 5, notificationView.bounds.size.width - 20, 30)];
-        label.text = message;
-        label.textColor = [UIColor whiteColor];
-        label.textAlignment = NSTextAlignmentCenter;
-        label.font = [UIFont systemFontOfSize:14];
-        [notificationView addSubview:label];
-        [window addSubview:notificationView];
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            [UIView animateWithDuration:0.5 animations:^{
-                notificationView.alpha = 0;
-            } completion:^(BOOL finished) {
-                [notificationView removeFromSuperview];
-            }];
-        });
-    });
-}
-
-+ (void)fixCameraWithLDRestart {
-    NSString *psPath = [NSString stringWithUTF8String:jbroot("/Library/MobileSubstrate/DynamicLibraries/PowerSelector.dylib")];
-    BOOL hasPowerSelector = [[NSFileManager defaultManager] fileExistsAtPath:psPath];
-    if (hasPowerSelector) {
-        NSString *psBin = [NSString stringWithUTF8String:jbroot("/usr/bin/powerselector")];
-        NSString *uicacheBin = [NSString stringWithUTF8String:jbroot("/usr/bin/uicache")];
-        NSTask *task = [[NSTask alloc] init];
-        [task setLaunchPath:psBin];
-        [task setArguments:@[@"ldrestart"]];
-        [task launch];
-        [GetFrame showMinimalNotification:@"正在重启服务以修复相机..."];
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            NSTask *uiCacheTask = [[NSTask alloc] init];
-            [uiCacheTask setLaunchPath:uicacheBin];
-            [uiCacheTask launch];
-            [GetFrame showMinimalNotification:@"相机修复完成"];
-        });
-    } else {
-        UIAlertController *alertController = [UIAlertController alertControllerWithTitle:@"需要 PowerSelector"
-                                                                                 message:@"请从 Cydia 安装 PowerSelector 以修复相机"
-                                                                          preferredStyle:UIAlertControllerStyleAlert];
-        [alertController addAction:[UIAlertAction actionWithTitle:@"好的" style:UIAlertActionStyleDefault handler:nil]];
-        [[GetFrame getKeyWindow].rootViewController presentViewController:alertController animated:YES completion:nil];
-    }
-}
 @end
-
-// MARK: - 视频选择器代理
-@interface VCAMPickerDelegate : NSObject <PHPickerViewControllerDelegate>
-@end
-
-@implementation VCAMPickerDelegate
-- (void)picker:(PHPickerViewController *)picker didFinishPicking:(NSArray<PHPickerResult *> *)results {
-    [picker dismissViewControllerAnimated:YES completion:nil];
-    if (results.count == 0) return;
-
-    PHPickerResult *result = results.firstObject;
-    NSItemProvider *provider = result.itemProvider;
-
-    if ([provider hasItemConformingToTypeIdentifier:UTTypeMovie.identifier]) {
-        [provider loadFileRepresentationForTypeIdentifier:UTTypeMovie.identifier completionHandler:^(NSURL *url, NSError *error) {
-            if (error || !url) return;
-            dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-                NSString *tempPath = [url path];
-                if ([g_fileManager fileExistsAtPath:g_tempFile]) [g_fileManager removeItemAtPath:g_tempFile error:nil];
-                NSError *copyError = nil;
-                if ([g_fileManager copyItemAtPath:tempPath toPath:g_tempFile error:&copyError]) {
-                    [g_fileManager createDirectoryAtPath:[NSString stringWithFormat:@"%@.new", g_tempFile] withIntermediateDirectories:YES attributes:nil error:nil];
-                    dispatch_async(dispatch_get_main_queue(), ^{
-                        [GetFrame setupAudioPlayback];
-                        [GetFrame showMinimalNotification:@"视频已加载"];
-                        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                            [g_fileManager removeItemAtPath:[NSString stringWithFormat:@"%@.new", g_tempFile] error:nil];
-                        });
-                    });
-                }
-            });
-        }];
-    }
-}
-@end
-
-// MARK: - 菜单
-void showVCAMMenu() {
-    NSString *str = g_pasteboard.string;
-    NSString *infoStr = @"使用镜头后将记录信息";
-    if (str != nil && [str hasPrefix:@"CCVCAM"]) {
-        str = [str substringFromIndex:6];
-        NSData *decodedData = [[NSData alloc] initWithBase64EncodedString:str options:0];
-        infoStr = [[NSString alloc] initWithData:decodedData encoding:NSUTF8StringEncoding];
-    }
-    NSString *title = @"iOS-VCAM";
-    if ([g_fileManager fileExistsAtPath:g_tempFile]) title = @"iOS-VCAM ✅";
-    UIAlertController *alertController = [UIAlertController alertControllerWithTitle:title message:infoStr preferredStyle:UIAlertControllerStyleAlert];
-
-    UIAlertAction *next = [UIAlertAction actionWithTitle:@"选择视频" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
-        if (@available(iOS 14.0, *)) {
-            PHPickerConfiguration *config = [[PHPickerConfiguration alloc] init];
-            config.filter = [PHPickerFilter videosFilter];
-            config.selectionLimit = 1;
-            PHPickerViewController *picker = [[PHPickerViewController alloc] initWithConfiguration:config];
-            static VCAMPickerDelegate *pickerDelegate = nil;
-            if (pickerDelegate == nil) pickerDelegate = [VCAMPickerDelegate new];
-            picker.delegate = pickerDelegate;
-            [[GetFrame getKeyWindow].rootViewController presentViewController:picker animated:YES completion:nil];
-        }
-    }];
-
-    UIAlertAction *download = [UIAlertAction actionWithTitle:@"下载视频" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
-        UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"下载视频" message:@"输入远程视频地址（MOV/MP4）" preferredStyle:UIAlertControllerStyleAlert];
-        [alert addTextFieldWithConfigurationHandler:^(UITextField *textField) {
-            textField.placeholder = @"http://...";
-            textField.keyboardType = UIKeyboardTypeURL;
-        }];
-        UIAlertAction *okAction = [UIAlertAction actionWithTitle:@"下载" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
-            g_downloadAddress = alert.textFields[0].text;
-            if ([g_downloadAddress isEqual:@""]) return;
-            g_downloadRunning = YES;
-            [GetFrame showMinimalNotification:@"开始下载..."];
-            dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-                NSString *tempPath = [NSString stringWithFormat:@"%@.downloading.mov", g_tempFile];
-                NSData *urlData = [NSData dataWithContentsOfURL:[NSURL URLWithString:g_downloadAddress]];
-                if ([urlData writeToFile:tempPath atomically:YES]) {
-                    AVAsset *asset = [AVAsset assetWithURL:[NSURL URLWithString:[NSString stringWithFormat:@"file://%@", tempPath]]];
-                    if (asset.playable) {
-                        if ([g_fileManager fileExistsAtPath:g_tempFile]) [g_fileManager removeItemAtPath:g_tempFile error:nil];
-                        [g_fileManager moveItemAtPath:tempPath toPath:g_tempFile error:nil];
-                        [g_fileManager createDirectoryAtPath:[NSString stringWithFormat:@"%@.new", g_tempFile] withIntermediateDirectories:YES attributes:nil error:nil];
-                        dispatch_async(dispatch_get_main_queue(), ^{
-                            [GetFrame showMinimalNotification:@"下载完成"];
-                            [g_fileManager removeItemAtPath:[NSString stringWithFormat:@"%@.new", g_tempFile] error:nil];
-                        });
-                    } else {
-                        dispatch_async(dispatch_get_main_queue(), ^{
-                            [GetFrame showMinimalNotification:@"视频格式无效"];
-                        });
-                    }
-                } else {
-                    dispatch_async(dispatch_get_main_queue(), ^{
-                        [GetFrame showMinimalNotification:@"下载失败"];
-                    });
-                }
-                g_downloadRunning = NO;
-            });
-        }];
-        UIAlertAction *cancel = [UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleDefault handler:nil];
-        [alert addAction:okAction];
-        [alert addAction:cancel];
-        [[GetFrame getKeyWindow].rootViewController presentViewController:alert animated:YES completion:nil];
-    }];
-
-    UIAlertAction *cancelReplace = [UIAlertAction actionWithTitle:@"禁用替换" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *action) {
-        if ([g_fileManager fileExistsAtPath:g_tempFile]) [g_fileManager removeItemAtPath:g_tempFile error:nil];
-    }];
-
-    UIAlertAction *fixCamera = [UIAlertAction actionWithTitle:@"修复相机" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
-        [GetFrame fixCameraWithLDRestart];
-    }];
-
-    UIAlertAction *cancel = [UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil];
-    [alertController addAction:next];
-    [alertController addAction:download];
-    [alertController addAction:cancelReplace];
-    [alertController addAction:fixCamera];
-    [alertController addAction:cancel];
-    [[GetFrame getKeyWindow].rootViewController presentViewController:alertController animated:YES completion:nil];
-}
 
 // MARK: - Hook
 CALayer *g_maskLayer = nil;
@@ -540,13 +274,6 @@ CALayer *g_maskLayer = nil;
                     if (copyBuffer) CFRelease(copyBuffer);
                     CMSampleBufferCreateCopy(kCFAllocatorDefault, newBuffer, &copyBuffer);
                     if (copyBuffer) [g_previewLayer enqueueSampleBuffer:copyBuffer];
-                    NSDate *datenow = [NSDate date];
-                    NSDateFormatter *formatter = [[NSDateFormatter alloc] init];
-                    [formatter setDateFormat:@"YYYY-MM-dd HH:mm:ss"];
-                    CGSize dimensions = self.bounds.size;
-                    NSString *str = [NSString stringWithFormat:@"%@\n%@ - %@\nW:%.0f H:%.0f", [formatter stringFromDate:datenow], [NSProcessInfo processInfo].processName, [NSString stringWithFormat:@"%@ - %@", g_cameraPosition, @"preview"], dimensions.width, dimensions.height];
-                    NSData *data = [str dataUsingEncoding:NSUTF8StringEncoding];
-                    [g_pasteboard setString:[NSString stringWithFormat:@"CCVCAM%@", [data base64EncodedStringWithOptions:0]]];
                 }
             }
         }
@@ -749,25 +476,10 @@ CALayer *g_maskLayer = nil;
         MSHookMessageEx([sampleBufferDelegate class], @selector(captureOutput:didOutputSampleBuffer:fromConnection:), imp_implementationWithBlock(^(id self, AVCaptureOutput *output, CMSampleBufferRef sampleBuffer, AVCaptureConnection *connection) {
             g_refreshPreviewByVideoDataOutputTime = ([[NSDate date] timeIntervalSince1970]) * 1000;
             CMSampleBufferRef newBuffer = [GetFrame getCurrentFrame:sampleBuffer :NO];
-            NSString *previewType = @"buffer";
             g_photoOrientation = [connection videoOrientation];
             if (newBuffer && g_previewLayer && g_previewLayer.readyForMoreMediaData) {
                 [g_previewLayer flush];
                 [g_previewLayer enqueueSampleBuffer:newBuffer];
-                previewType = @"buffer - preview";
-            }
-            static NSTimeInterval oldTime = 0;
-            NSTimeInterval nowTime = g_refreshPreviewByVideoDataOutputTime;
-            if (nowTime - oldTime > 3000) {
-                oldTime = nowTime;
-                CMFormatDescriptionRef formatDescription = CMSampleBufferGetFormatDescription(sampleBuffer);
-                CMVideoDimensions dimensions = CMVideoFormatDescriptionGetDimensions(formatDescription);
-                NSDate *datenow = [NSDate date];
-                NSDateFormatter *formatter = [[NSDateFormatter alloc] init];
-                [formatter setDateFormat:@"YYYY-MM-dd HH:mm:ss"];
-                NSString *str = [NSString stringWithFormat:@"%@\n%@ - %@\nW:%d H:%d", [formatter stringFromDate:datenow], [NSProcessInfo processInfo].processName, [NSString stringWithFormat:@"%@ - %@", g_cameraPosition, previewType], dimensions.width, dimensions.height];
-                NSData *data = [str dataUsingEncoding:NSUTF8StringEncoding];
-                [g_pasteboard setString:[NSString stringWithFormat:@"CCVCAM%@", [data base64EncodedStringWithOptions:0]]];
             }
             return original_method(self, @selector(captureOutput:didOutputSampleBuffer:fromConnection:), output, newBuffer ?: sampleBuffer, connection);
         }), (IMP*)&original_method);
@@ -788,9 +500,6 @@ CALayer *g_maskLayer = nil;
     updatePreferences();
 
     CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), NULL, prefsChanged, CFSTR("com.trizau.sileo.vcam.prefschanged"), NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
-
-    // 启动音量键 KVO 监听
-    g_volumeObserver = [[VCAMVolumeObserver alloc] init];
 }
 
 %dtor {
@@ -801,5 +510,4 @@ CALayer *g_maskLayer = nil;
     g_previewLayer = nil;
     g_refreshPreviewByVideoDataOutputTime = 0;
     g_cameraRunning = NO;
-    g_volumeObserver = nil;
 }
