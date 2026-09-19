@@ -84,20 +84,6 @@
         </dict>
         <dict>
             <key>cell</key>
-            <string>PSSwitchCell</string>
-            <key>default</key>
-            <false/>
-            <key>defaults</key>
-            <string>com.trizau.sileo.vcam</string>
-            <key>key</key>
-            <string>systemCameraMode</string>
-            <key>label</key>
-            <string>系统相机替换模式</string>
-            <key>PostNotification</key>
-            <string>com.trizau.sileo.vcam.prefschanged</string>
-        </dict>
-        <dict>
-            <key>cell</key>
             <string>PSGroupCell</string>
             <key>label</key>
             <string>工具</string>
