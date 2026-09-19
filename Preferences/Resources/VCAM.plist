@@ -7,18 +7,17 @@
         <dict>
             <key>cell</key>
             <string>PSGroupCell</string>
-            <keyanged>label</key>
+            <key>label</key>
             <string>视频替换</string>
-        </dict</>
+        </dict>
         <dict>
             <key>cell</key>
-            <string>PSButtonCellstring</string>
+            <string>PSButtonCell</string>
             <key>label</key>
-            <string>选择视频>
-</string>
+            <string>选择视频</string>
             <key>action</key>
             <string>selectVideo</string>
-        </       dict>
+        </dict>
         <dict>
             <key>cell</key>
             <string>PSButtonCell</string>
@@ -53,7 +52,8 @@
             <key>label</key>
             <string>启用音频</string>
             <key>PostNotification</key>
-            <string>com.trizau.sileo.vcam.prefsch </dict>
+            <string>com.trizau.sileo.vcam.prefschanged</string>
+        </dict>
         <dict>
             <key>cell</key>
             <string>PSSwitchCell</string>
