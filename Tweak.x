@@ -179,27 +179,15 @@ CALayer *g_maskLayer = nil;
     }
     if (g_cameraRunning && g_previewLayer) {
         g_previewLayer.frame = self.bounds;
-        switch(g_photoOrientation) {
-            case AVCaptureVideoOrientationPortrait:
-            case AVCaptureVideoOrientationPortraitUpsideDown:
-                g_previewLayer.transform = CATransform3DMakeRotation(0, 0, 0, 1);
-                break;
-            case AVCaptureVideoOrientationLandscapeRight:
-                g_previewLayer.transform = CATransform3DMakeRotation(M_PI_2, 0, 0, 1);
-                break;
-            case AVCaptureVideoOrientationLandscapeLeft:
-                g_previewLayer.transform = CATransform3DMakeRotation(-M_PI_2, 0, 0, 1);
-                break;
-            default:
-                g_previewLayer.transform = self.transform;
-        }
+        // ⭐ 不做任何旋转，视频以自身方向直接显示
+        g_previewLayer.transform = CATransform3DIdentity;
+
         static NSTimeInterval refreshTime = 0;
         NSTimeInterval nowTime = [[NSDate date] timeIntervalSince1970] * 1000;
         if (nowTime - g_refreshPreviewByVideoDataOutputTime > 1000) {
             static CMSampleBufferRef copyBuffer = nil;
             if (nowTime - refreshTime > 1000 / 33 && g_previewLayer.readyForMoreMediaData) {
                 refreshTime = nowTime;
-                g_photoOrientation = -1;
                 CMSampleBufferRef newBuffer = [GetFrame getCurrentFrame:nil :NO];
                 if (newBuffer) {
                     [g_previewLayer flush];
@@ -257,26 +245,7 @@ CALayer *g_maskLayer = nil;
     if (newBuffer) {
         CVImageBufferRef pixelBuffer = CMSampleBufferGetImageBuffer(newBuffer);
         CIImage *ciimage = [CIImage imageWithCVImageBuffer:pixelBuffer];
-        if (@available(iOS 11.0, *)) {
-            switch(g_photoOrientation) {
-                case AVCaptureVideoOrientationPortrait:
-                    ciimage = [ciimage imageByApplyingCGOrientation:kCGImagePropertyOrientationUp];
-                    break;
-                case AVCaptureVideoOrientationPortraitUpsideDown:
-                    ciimage = [ciimage imageByApplyingCGOrientation:kCGImagePropertyOrientationDown];
-                    break;
-                case AVCaptureVideoOrientationLandscapeRight:
-                    ciimage = [ciimage imageByApplyingCGOrientation:kCGImagePropertyOrientationRight];
-                    break;
-                case AVCaptureVideoOrientationLandscapeLeft:
-                    ciimage = [ciimage imageByApplyingCGOrientation:kCGImagePropertyOrientationLeft];
-                    break;
-            }
-        }
         UIImage *uiimage = [UIImage imageWithCIImage:ciimage scale:2.0f orientation:UIImageOrientationUp];
-        if ([g_fileManager fileExistsAtPath:g_isMirroredMark]) {
-            uiimage = [UIImage imageWithCIImage:ciimage scale:2.0f orientation:UIImageOrientationUpMirrored];
-        }
         return UIImageJPEGRepresentation(uiimage, 1);
     }
     return %orig;
@@ -289,26 +258,7 @@ CALayer *g_maskLayer = nil;
     if (newBuffer) {
         CVImageBufferRef pixelBuffer = CMSampleBufferGetImageBuffer(newBuffer);
         CIImage *ciimage = [CIImage imageWithCVImageBuffer:pixelBuffer];
-        if (@available(iOS 11.0, *)) {
-            switch(g_photoOrientation) {
-                case AVCaptureVideoOrientationPortrait:
-                    ciimage = [ciimage imageByApplyingCGOrientation:kCGImagePropertyOrientationUp];
-                    break;
-                case AVCaptureVideoOrientationPortraitUpsideDown:
-                    ciimage = [ciimage imageByApplyingCGOrientation:kCGImagePropertyOrientationDown];
-                    break;
-                case AVCaptureVideoOrientationLandscapeRight:
-                    ciimage = [ciimage imageByApplyingCGOrientation:kCGImagePropertyOrientationRight];
-                    break;
-                case AVCaptureVideoOrientationLandscapeLeft:
-                    ciimage = [ciimage imageByApplyingCGOrientation:kCGImagePropertyOrientationLeft];
-                    break;
-            }
-        }
         UIImage *uiimage = [UIImage imageWithCIImage:ciimage scale:2.0f orientation:UIImageOrientationUp];
-        if ([g_fileManager fileExistsAtPath:g_isMirroredMark]) {
-            uiimage = [UIImage imageWithCIImage:ciimage scale:2.0f orientation:UIImageOrientationUpMirrored];
-        }
         return UIImageJPEGRepresentation(uiimage, 1);
     }
     return %orig;
@@ -344,9 +294,6 @@ CALayer *g_maskLayer = nil;
                             CMSampleBufferCreateCopy(kCFAllocatorDefault, newBuffer, &copyBuffer);
                             __block CVImageBufferRef imageBuffer = CMSampleBufferGetImageBuffer(copyBuffer);
                             CIImage *ciimage = [CIImage imageWithCVImageBuffer:imageBuffer];
-                            CIImage *ciimageRotate = [ciimage imageByApplyingCGOrientation:kCGImagePropertyOrientationLeft];
-                            CIContext *cicontext = [CIContext new];
-                            __block CGImageRef _Nullable cgimage = [cicontext createCGImage:ciimageRotate fromRect:ciimageRotate.extent];
                             UIImage *uiimage = [UIImage imageWithCIImage:ciimage];
                             __block NSData *theNewPhoto = UIImageJPEGRepresentation(uiimage, 1);
 
@@ -372,18 +319,6 @@ CALayer *g_maskLayer = nil;
                                 if ([g_fileManager fileExistsAtPath:g_tempFile]) return imageBuffer;
                                 return pixelBuffer(self, @selector(pixelBuffer));
                             }), (IMP*)&pixelBuffer);
-
-                            __block CGImageRef _Nullable(*CGImageRepresentation)(id self, SEL _cmd);
-                            MSHookMessageEx([photo class], @selector(CGImageRepresentation), imp_implementationWithBlock(^(id self, SEL _cmd) {
-                                if ([g_fileManager fileExistsAtPath:g_tempFile]) return cgimage;
-                                return CGImageRepresentation(self, @selector(CGImageRepresentation));
-                            }), (IMP*)&CGImageRepresentation);
-
-                            __block CGImageRef _Nullable(*previewCGImageRepresentation)(id self, SEL _cmd);
-                            MSHookMessageEx([photo class], @selector(previewCGImageRepresentation), imp_implementationWithBlock(^(id self, SEL _cmd) {
-                                if ([g_fileManager fileExistsAtPath:g_tempFile]) return cgimage;
-                                return previewCGImageRepresentation(self, @selector(previewCGImageRepresentation));
-                            }), (IMP*)&previewCGImageRepresentation);
                         }
                         g_canReleaseBuffer = YES;
                         return original_method(self, @selector(captureOutput:didFinishProcessingPhoto:error:), captureOutput, photo, error);
