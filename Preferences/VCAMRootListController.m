@@ -369,5 +369,8 @@
     [alert addAction:[UIAlertAction actionWithTitle:@"好的" style:UIAlertActionStyleDefault handler:nil]];
     [self presentViewController:alert animated:YES completion:nil];
 }
-
+- (void)showDebugLog {
+    VCAMDebugLogController *vc = [[VCAMDebugLogController alloc] init];
+    [self.navigationController pushViewController:vc animated:YES];
+}
 @end
