@@ -6,4 +6,4 @@ Description: Replace camera with custom video, support audio and iOS 15+
 Maintainer: trizau
 Author: trizau
 Section: Tweaks
-Depends: mobilesubstrate (>= 0.9.5000), firmware (>= 11.0)
+Depends: mobilesubstrate
