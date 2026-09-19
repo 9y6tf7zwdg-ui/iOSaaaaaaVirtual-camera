@@ -98,35 +98,86 @@
     PHPickerResult *result = results.firstObject;
     NSItemProvider *provider = result.itemProvider;
 
-    if ([provider hasItemConformingToTypeIdentifier:UTTypeMovie.identifier]) {
-        [provider loadFileRepresentationForTypeIdentifier:UTTypeMovie.identifier completionHandler:^(NSURL *url, NSError *error) {
-            if (error || !url) return;
-            dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-                NSFileManager *fm = [NSFileManager defaultManager];
-                if ([fm fileExistsAtPath:self.tempFilePath]) {
-                    [fm removeItemAtPath:self.tempFilePath error:nil];
-                }
-                NSError *copyError = nil;
-                if ([fm copyItemAtPath:[url path] toPath:self.tempFilePath error:&copyError]) {
-                    [fm createDirectoryAtPath:[NSString stringWithFormat:@"%@.new", self.tempFilePath] withIntermediateDirectories:YES attributes:nil error:nil];
-                    dispatch_async(dispatch_get_main_queue(), ^{
-                        UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"VCAM" message:@"视频已加载，打开相机即可看到替换效果" preferredStyle:UIAlertControllerStyleAlert];
-                        [alert addAction:[UIAlertAction actionWithTitle:@"好的" style:UIAlertActionStyleDefault handler:nil]];
-                        [self presentViewController:alert animated:YES completion:nil];
-                        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                            [fm removeItemAtPath:[NSString stringWithFormat:@"%@.new", self.tempFilePath] error:nil];
-                        });
-                    });
-                } else {
-                    dispatch_async(dispatch_get_main_queue(), ^{
-                        UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"VCAM" message:[NSString stringWithFormat:@"视频加载失败：%@", copyError.localizedDescription] preferredStyle:UIAlertControllerStyleAlert];
-                        [alert addAction:[UIAlertAction actionWithTitle:@"好的" style:UIAlertActionStyleDefault handler:nil]];
-                        [self presentViewController:alert animated:YES completion:nil];
-                    });
-                }
-            });
-        }];
+    if (![provider hasItemConformingToTypeIdentifier:UTTypeMovie.identifier]) {
+        [self showAlertWithTitle:@"VCAM" message:@"未找到有效的视频"];
+        return;
     }
+
+    [provider loadFileRepresentationForTypeIdentifier:UTTypeMovie.identifier
+                                    completionHandler:^(NSURL *url, NSError *error) {
+        if (error || !url) {
+            NSLog(@"[VCAM] loadFileRepresentation 失败: %@", error);
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [self showAlertWithTitle:@"VCAM" message:[NSString stringWithFormat:@"加载失败：%@", error.localizedDescription]];
+            });
+            return;
+        }
+
+        // 关键步骤1：在回调闭包内立即获取安全作用域访问权限
+        BOOL accessing = [url startAccessingSecurityScopedResource];
+
+        // 关键步骤2：在回调闭包内立即读取数据到内存，绝不丢到后台线程再读
+        NSData *videoData = [NSData dataWithContentsOfURL:url];
+        if (accessing) [url stopAccessingSecurityScopedResource];
+
+        if (!videoData || videoData.length == 0) {
+            NSLog(@"[VCAM] 读取视频数据为空，可能是 iCloud 视频未下载或权限问题");
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [self showAlertWithTitle:@"VCAM" message:@"读取视频失败。请确认视频已下载到本地，或换一个视频重试"];
+            });
+            return;
+        }
+
+        // 关键步骤3：先把数据写到 NSTemporaryDirectory，避免直接覆盖导致插件读半截
+        NSFileManager *fm = [NSFileManager defaultManager];
+        NSString *tempCopyPath = [NSTemporaryDirectory() stringByAppendingPathComponent:@"vcam_import.mov"];
+        if ([fm fileExistsAtPath:tempCopyPath]) {
+            [fm removeItemAtPath:tempCopyPath error:nil];
+        }
+
+        NSError *writeError = nil;
+        if (![videoData writeToFile:tempCopyPath options:NSDataWritingAtomic error:&writeError]) {
+            NSLog(@"[VCAM] 写入临时文件失败: %@", writeError);
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [self showAlertWithTitle:@"VCAM" message:@"写入临时文件失败"];
+            });
+            return;
+        }
+
+        // 关键步骤4：验证视频格式是否可播放
+        AVAsset *asset = [AVAsset assetWithURL:[NSURL fileURLWithPath:tempCopyPath]];
+        if (!asset.playable) {
+            NSLog(@"[VCAM] 视频不可播放");
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [self showAlertWithTitle:@"VCAM" message:@"视频格式不可播放，请换一个 MOV 或 MP4"];
+            });
+            return;
+        }
+
+        // 关键步骤5：全部校验通过后，再替换到插件读取的目标路径
+        dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+            if ([fm fileExistsAtPath:self.tempFilePath]) {
+                [fm removeItemAtPath:self.tempFilePath error:nil];
+            }
+            NSError *moveError = nil;
+            if ([fm moveItemAtPath:tempCopyPath toPath:self.tempFilePath error:&moveError]) {
+                [fm createDirectoryAtPath:[NSString stringWithFormat:@"%@.new", self.tempFilePath]
+                    withIntermediateDirectories:YES attributes:nil error:nil];
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    [self showAlertWithTitle:@"VCAM" message:@"视频已加载，打开相机即可看到替换效果"];
+                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
+                                   dispatch_get_main_queue(), ^{
+                        [fm removeItemAtPath:[NSString stringWithFormat:@"%@.new", self.tempFilePath] error:nil];
+                    });
+                });
+            } else {
+                NSLog(@"[VCAM] 移动视频到目标路径失败: %@", moveError);
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    [self showAlertWithTitle:@"VCAM" message:[NSString stringWithFormat:@"视频加载失败：%@", moveError.localizedDescription]];
+                });
+            }
+        });
+    }];
 }
 
 - (void)downloadVideo {
