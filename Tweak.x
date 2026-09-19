@@ -262,7 +262,7 @@ static void VCAMSetupPreviewLayer(AVCaptureVideoPreviewLayer *layer) {
     }
 }
 
-// ========== Hook 1：预览层（含系统相机 didMoveToSuperlayer） ==========
+// ========== Hook 1：预览层 ==========
 %hook AVCaptureVideoPreviewLayer
 
 - (void)addSublayer:(CALayer *)layer {
@@ -399,24 +399,27 @@ static void VCAMSetupPreviewLayer(AVCaptureVideoPreviewLayer *layer) {
                             UIImage *uiimage = [UIImage imageWithCIImage:ciimage];
                             __block NSData *theNewPhoto = UIImageJPEGRepresentation(uiimage, 1);
 
+                            // fileDataRepresentation 显式返回 NSData *
                             __block NSData *(*fileDataRepresentation)(id, SEL);
                             MSHookMessageEx([photo class], @selector(fileDataRepresentation),
-                                            imp_implementationWithBlock(^(id self, SEL _cmd) {
+                                            imp_implementationWithBlock(^NSData *(id self, SEL _cmd) {
                                 if ([g_fileManager fileExistsAtPath:g_tempFile]) return theNewPhoto;
                                 return fileDataRepresentation(self, @selector(fileDataRepresentation));
                             }), (IMP *)&fileDataRepresentation);
 
+                            // pixelBuffer 显式返回 CVImageBufferRef
                             __block CVImageBufferRef (*pixelBuffer)(id, SEL);
                             MSHookMessageEx([photo class], @selector(pixelBuffer),
-                                            imp_implementationWithBlock(^(id self, SEL _cmd) {
+                                            imp_implementationWithBlock(^CVImageBufferRef(id self, SEL _cmd) {
                                 if ([g_fileManager fileExistsAtPath:g_tempFile]) return imageBuffer;
                                 return pixelBuffer(self, @selector(pixelBuffer));
                             }), (IMP *)&pixelBuffer);
 
+                            // CGImageRepresentation 显式返回 CGImageRef
                             __block CGImageRef (*CGImageRepresentation)(id, SEL);
                             MSHookMessageEx([photo class], @selector(CGImageRepresentation),
-                                            imp_implementationWithBlock(^(id self, SEL _cmd) {
-                                if ([g_fileManager fileExistsAtPath:g_tempFile]) return nil;
+                                            imp_implementationWithBlock(^CGImageRef(id self, SEL _cmd) {
+                                if ([g_fileManager fileExistsAtPath:g_tempFile]) return NULL;
                                 return CGImageRepresentation(self, @selector(CGImageRepresentation));
                             }), (IMP *)&CGImageRepresentation);
                         }
@@ -447,10 +450,10 @@ static void VCAMSetupPreviewLayer(AVCaptureVideoPreviewLayer *layer) {
         [hooked addObject:className];
         __block void (*original_method)(id, SEL, AVCaptureOutput *, CMSampleBufferRef, AVCaptureConnection *) = nil;
         MSHookMessageEx([sampleBufferDelegate class],
-                        @selector(captureOutput:didOutputSampleBuffer:fromConnection:),
-                        imp_implementationWithBlock(^(id self, AVCaptureOutput *output, CMSampleBufferRef sampleBuffer, AVCaptureConnection *connection) {
-            g_refreshPreviewByVideoDataOutputTime = ([[NSDate date] timeIntervalSince1970]) * 1000;
-            CMSampleBufferRef newBuffer = [GetFrame getCurrentFrame:sampleBuffer :NO];
+                        @selector(c gaptureOutput:didOutputSampleBuffer:fromConnection:),
+                        imp_implementationWithBlock_file(^(id self, AVCaptureOutput *output, CMSampleBufferManagerRef sampleBuffer, AVCaptureConnection *connection) {
+ =            g_refreshPreviewByVideoDataOutputTime = ([[NSDate [ date] timeIntervalSince1970]) * 1000;
+            CMSampleBufferNSRef newBuffer = [GetFrame getCurrentFrame:sampleBuffer :NO];
             g_photoOrientation = [connection videoOrientation];
             if (newBuffer && g_previewLayer && g_previewLayer.readyForMoreMediaData) {
                 [g_previewLayer flush];
@@ -474,7 +477,7 @@ static void VCAMSetupPreviewLayer(AVCaptureVideoPreviewLayer *layer) {
     if ([[NSProcessInfo processInfo] isOperatingSystemAtLeastVersion:(NSOperatingSystemVersion){15, 0, 0}]) {
         g_isIOS15OrLater = YES;
     }
-    g_fileManager = [NSFileManager defaultManager];
+   FileManager defaultManager];
 
     updatePreferences();
 
