@@ -6,6 +6,7 @@
 #import <substrate.h>
 #import "VCAMDebugLog.h"
 
+// ========== 全局变量 ==========
 static NSFileManager *g_fileManager = nil;
 static BOOL g_canReleaseBuffer = YES;
 static BOOL g_bufferReload = YES;
@@ -55,7 +56,6 @@ static void VCAMStartWatchdog(void) {
     if (g_watchdogTimer) return;
     dispatch_async(dispatch_get_main_queue(), ^{
         g_watchdogTimer = [NSTimer scheduledTimerWithTimeInterval:2.0 repeats:YES block:^(NSTimer *timer) {
-            // 如果长时间没有更新预览，强制刷新 buffer
             if (g_cameraRunning && g_previewLayer) {
                 NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
                 if (now - g_lastBufferRefreshTime > 5.0) {
@@ -120,7 +120,6 @@ static void VCAMStartWatchdog(void) {
         }
     }
 
-    // 在后台线程安全地读取
     __block CMSampleBufferRef buf32 = nil;
     __block CMSampleBufferRef bufVR = nil;
     __block CMSampleBufferRef bufFR = nil;
@@ -256,6 +255,7 @@ static CADisplayLink *g_displayLink = nil;
 
 static void VCAMSetupPreviewLayer(AVCaptureVideoPreviewLayer *layer) {
     if (!layer) return;
+    if (![g_fileManager fileExistsAtPath:g_tempFile]) return;
     if ([[layer sublayers] containsObject:g_previewLayer]) return;
 
     VCAM_LOG(@"VCAMSetupPreviewLayer 触发 sublayers=%lu", (unsigned long)layer.sublayers.count);
@@ -284,12 +284,6 @@ static void VCAMSetupPreviewLayer(AVCaptureVideoPreviewLayer *layer) {
 
 - (void)addSublayer:(CALayer *)layer {
     %orig;
-    VCAMSetupPreviewLayer(self);
-}
-
-- (void)didMoveToSuperlayer {
-    %orig;
-    VCAM_LOG(@"didMoveToSuperlayer: superlayer=%@", NSStringFromClass([self.superlayer class]));
     VCAMSetupPreviewLayer(self);
 }
 
