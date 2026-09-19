@@ -4,7 +4,7 @@
 #import <AudioToolbox/AudioToolbox.h>
 #include <roothide.h>
 #import <substrate.h>
-#import "VCAMSystemCamera.h"   // ⭐ 新增
+#import "VCAMSystemCamera.h"
 
 static NSFileManager *g_fileManager = nil;
 static BOOL g_canReleaseBuffer = YES;
@@ -15,7 +15,6 @@ static BOOL g_cameraRunning = NO;
 static NSString *g_cameraPosition = @"B";
 static AVCaptureVideoOrientation g_photoOrientation = AVCaptureVideoOrientationPortrait;
 
-// ⭐ 改动 1：去掉 static，让 VCAMSystemCamera.x 也能读到
 BOOL g_systemCameraMode = NO;
 
 static AVAssetReader *reader = nil;
@@ -49,7 +48,7 @@ static BOOL getBoolFromPreferences(NSString *key, BOOL defaultValue) {
 
 static void updatePreferences() {
     loadPreferences();
-    g_systemCameraMode = getBoolFromPreferences(@"systemCameraMode", NO);   // ⭐ 新增
+    g_systemCameraMode = getBoolFromPreferences(@"systemCameraMode", NO);
 }
 
 static void prefsChanged(CFNotificationCenterRef center, void *observer, CFStringRef name, const void *object, CFDictionaryRef userInfo) {
@@ -174,7 +173,6 @@ static void prefsChanged(CFNotificationCenterRef center, void *observer, CFStrin
 
 CALayer *g_maskLayer = nil;
 
-// ⭐ 改动 2：去掉 static，让 VCAMSystemCamera.x 能调用
 void VCAMSetupPreviewLayer(AVCaptureVideoPreviewLayer *layer) {
     if (!layer) return;
     if ([[layer sublayers] containsObject:g_previewLayer]) return;
@@ -216,7 +214,6 @@ void VCAMSetupPreviewLayer(AVCaptureVideoPreviewLayer *layer) {
         if (g_previewLayer) g_previewLayer.opacity = 0;
     }
 
-    // ⭐ 改动 3：加上 g_systemCameraMode 判断，系统相机模式下也持续渲染
     if ((g_cameraRunning || g_systemCameraMode) && g_previewLayer) {
         g_previewLayer.frame = self.bounds;
         g_previewLayer.transform = CATransform3DIdentity;
@@ -296,7 +293,7 @@ void VCAMSetupPreviewLayer(AVCaptureVideoPreviewLayer *layer) {
     CMSampleBufferRef newBuffer = [GetFrame getCurrentFrame:nil :NO];
     if (newBuffer) {
         CVImageBufferRef pixelBuffer = CMSampleBufferGetImageBuffer(newBuffer);
-        CIImage *ciimage = [CIImage imageWithCIImage:pixelBuffer];
+        CIImage *ciimage = [CIImage imageWithCVImageBuffer:pixelBuffer];
         UIImage *uiimage = [UIImage imageWithCIImage:ciimage scale:2.0f orientation:UIImageOrientationUp];
         return UIImageJPEGRepresentation(uiimage, 1);
     }
