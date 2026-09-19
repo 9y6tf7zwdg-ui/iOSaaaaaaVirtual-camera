@@ -5,7 +5,6 @@
 #import <PhotosUI/PhotosUI.h>
 #import <AVFoundation/AVFoundation.h>
 #include <roothide.h>
-#import "VCAMVideoTrimController.h"
 
 @interface NSTask : NSObject
 @property (nonatomic, retain) NSString *launchPath;
@@ -14,7 +13,7 @@
 - (void)waitUntilExit;
 @end
 
-@interface VCAMRootListController : PSListController <PHPickerViewControllerDelegate, VCAMVideoTrimDelegate>
+@interface VCAMRootListController : PSListController <PHPickerViewControllerDelegate, UINavigationControllerDelegate, UIImagePickerControllerDelegate, UIVideoEditorControllerDelegate>
 @property (nonatomic, strong) NSString *tempFilePath;
 @property (nonatomic, strong) NSString *mirrorMarkPath;
 @property (nonatomic, assign) BOOL downloadRunning;
@@ -77,6 +76,8 @@
     [self presentViewController:alert animated:YES completion:nil];
 }
 
+#pragma mark - 选择视频
+
 - (void)selectVideo {
     if (@available(iOS 14.0, *)) {
         PHPickerConfiguration *config = [[PHPickerConfiguration alloc] init];
@@ -86,9 +87,7 @@
         picker.delegate = self;
         [self presentViewController:picker animated:YES completion:nil];
     } else {
-        UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"提示" message:@"此功能需要 iOS 14.0 或以上版本" preferredStyle:UIAlertControllerStyleAlert];
-        [alert addAction:[UIAlertAction actionWithTitle:@"好的" style:UIAlertActionStyleDefault handler:nil]];
-        [self presentViewController:alert animated:YES completion:nil];
+        [self showAlertWithTitle:@"提示" message:@"此功能需要 iOS 14.0 或以上版本"];
     }
 }
 
@@ -144,47 +143,80 @@
             return;
         }
 
+        // 用系统原生的 UIVideoEditorController 打开剪辑界面
         dispatch_async(dispatch_get_main_queue(), ^{
-            VCAMVideoTrimController *trimVC = [[VCAMVideoTrimController alloc] initWithAsset:asset delegate:self];
-            UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:trimVC];
-            nav.modalPresentationStyle = UIModalPresentationPageSheet;
-            [self presentViewController:nav animated:YES completion:nil];
+            [self openNativeEditorWithPath:tempCopyPath];
         });
     }];
 }
 
-#pragma mark - VCAMVideoTrimDelegate
+#pragma mark - 原生视频剪辑界面
 
-- (void)videoTrimController:(UIViewController *)controller didFinishWithURL:(NSURL *)trimmedURL {
-    [controller dismissViewControllerAnimated:YES completion:^{
-        NSFileManager *fm = [NSFileManager defaultManager];
-        dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-            if ([fm fileExistsAtPath:self.tempFilePath]) {
-                [fm removeItemAtPath:self.tempFilePath error:nil];
-            }
-            NSError *moveError = nil;
-            if ([fm moveItemAtPath:trimmedURL.path toPath:self.tempFilePath error:&moveError]) {
-                [fm createDirectoryAtPath:[NSString stringWithFormat:@"%@.new", self.tempFilePath]
-                    withIntermediateDirectories:YES attributes:nil error:nil];
-                dispatch_async(dispatch_get_main_queue(), ^{
-                    [self showAlertWithTitle:@"VCAM" message:@"视频已加载，打开相机即可看到替换效果"];
-                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
-                                   dispatch_get_main_queue(), ^{
-                        [fm removeItemAtPath:[NSString stringWithFormat:@"%@.new", self.tempFilePath] error:nil];
-                    });
-                });
-            } else {
-                dispatch_async(dispatch_get_main_queue(), ^{
-                    [self showAlertWithTitle:@"VCAM" message:@"保存视频失败"];
-                });
-            }
-        });
+- (void)openNativeEditorWithPath:(NSString *)path {
+    if (![UIVideoEditorController canEditVideoAtPath:path]) {
+        // 如果系统不支持（比如视频格式特殊），直接使用原视频
+        [self finalizeVideoWithPath:path];
+        return;
+    }
+
+    UIVideoEditorController *editor = [[UIVideoEditorController alloc] init];
+    editor.videoPath = path;
+    // 视频最大时长，设大一些让用户自由裁剪（单位：秒）
+    editor.videoMaximumDuration = 3600.0;
+    editor.videoQuality = UIImagePickerControllerQualityTypeHigh;
+    editor.delegate = self;
+    editor.modalPresentationStyle = UIModalPresentationFullScreen;
+    [self presentViewController:editor animated:YES completion:nil];
+}
+
+#pragma mark - UIVideoEditorControllerDelegate
+
+- (void)videoEditorController:(UIVideoEditorController *)editor didSaveEditedVideoToPath:(NSString *)editedVideoPath {
+    [editor dismissViewControllerAnimated:YES completion:^{
+        NSLog(@"[VCAM] 用户保存了剪辑后的视频: %@", editedVideoPath);
+        [self finalizeVideoWithPath:editedVideoPath];
     }];
 }
 
-- (void)videoTrimControllerDidCancel:(UIViewController *)controller {
-    [controller dismissViewControllerAnimated:YES completion:nil];
+- (void)videoEditorController:(UIVideoEditorController *)editor didFailWithError:(NSError *)error {
+    [editor dismissViewControllerAnimated:YES completion:^{
+        NSLog(@"[VCAM] 视频剪辑失败: %@", error);
+        [self showAlertWithTitle:@"VCAM" message:[NSString stringWithFormat:@"剪辑失败：%@", error.localizedDescription ?: @"未知错误"]];
+    }];
 }
+
+- (void)videoEditorControllerDidCancel:(UIVideoEditorController *)editor {
+    [editor dismissViewControllerAnimated:YES completion:nil];
+}
+
+#pragma mark - 保存视频到目标路径
+
+- (void)finalizeVideoWithPath:(NSString *)sourcePath {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        if ([fm fileExistsAtPath:self.tempFilePath]) {
+            [fm removeItemAtPath:self.tempFilePath error:nil];
+        }
+        NSError *moveError = nil;
+        if ([fm moveItemAtPath:sourcePath toPath:self.tempFilePath error:&moveError]) {
+            [fm createDirectoryAtPath:[NSString stringWithFormat:@"%@.new", self.tempFilePath]
+                withIntermediateDirectories:YES attributes:nil error:nil];
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [self showAlertWithTitle:@"VCAM" message:@"视频已加载，打开相机即可看到替换效果"];
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
+                               dispatch_get_main_queue(), ^{
+                    [fm removeItemAtPath:[NSString stringWithFormat:@"%@.new", self.tempFilePath] error:nil];
+                });
+            });
+        } else {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [self showAlertWithTitle:@"VCAM" message:[NSString stringWithFormat:@"保存视频失败：%@", moveError.localizedDescription]];
+            });
+        }
+    });
+}
+
+#pragma mark - 下载视频
 
 - (void)downloadVideo {
     if (self.downloadRunning) return;
@@ -245,6 +277,8 @@
     [alert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
     [self presentViewController:alert animated:YES completion:nil];
 }
+
+#pragma mark - 其他操作
 
 - (void)disableReplacement {
     NSFileManager *fm = [NSFileManager defaultManager];
