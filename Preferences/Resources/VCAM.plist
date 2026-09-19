@@ -8,7 +8,37 @@
             <key>cell</key>
             <string>PSGroupCell</string>
             <key>label</key>
-            <string>常规设置</string>
+            <string>视频替换</string>
+        </dict>
+        <dict>
+            <key>cell</key>
+            <string>PSButtonCell</string>
+            <key>label</key>
+            <string>选择视频</string>
+            <key>action</key>
+            <string>selectVideo</string>
+        </dict>
+        <dict>
+            <key>cell</key>
+            <string>PSButtonCell</string>
+            <key>label</key>
+            <string>下载视频</string>
+            <key>action</key>
+            <string>downloadVideo</string>
+        </dict>
+        <dict>
+            <key>cell</key>
+            <string>PSButtonCell</string>
+            <key>label</key>
+            <string>禁用替换</string>
+            <key>action</key>
+            <string>disableReplacement</string>
+        </dict>
+        <dict>
+            <key>cell</key>
+            <string>PSGroupCell</string>
+            <key>label</key>
+            <string>功能开关</string>
         </dict>
         <dict>
             <key>cell</key>
@@ -51,6 +81,28 @@
             <string>极简 UI 模式</string>
             <key>PostNotification</key>
             <string>com.trizau.sileo.vcam.prefschanged</string>
+        </dict>
+        <dict>
+            <key>cell</key>
+            <string>PSGroupCell</string>
+            <key>label</key>
+            <string>工具</string>
+        </dict>
+        <dict>
+            <key>cell</key>
+            <string>PSButtonCell</string>
+            <key>label</key>
+            <string>修复相机</string>
+            <key>action</key>
+            <string>fixCamera</string>
+        </dict>
+        <dict>
+            <key>cell</key>
+            <string>PSButtonCell</string>
+            <key>label</key>
+            <string>切换镜像修复</string>
+            <key>action</key>
+            <string>toggleMirrorFix</string>
         </dict>
     </array>
 </dict>
