@@ -4,6 +4,7 @@
 #import <AudioToolbox/AudioToolbox.h>
 #include <roothide.h>
 #import <substrate.h>
+#import "VCAMDebugLog.h"
 #import "VCAMSystemCamera.h"
 
 static NSFileManager *g_fileManager = nil;
@@ -102,7 +103,7 @@ static void prefsChanged(CFNotificationCenterRef center, void *observer, CFStrin
             [reader addOutput:videoTrackout_420YpCbCr8BiPlanarFullRange];
             [reader startReading];
         } @catch (NSException *except) {
-            NSLog(@"[VCAM] 初始化读取视频出错:%@", except);
+            VCAM_LOG(@"初始化读取视频出错:%@", except);
         }
     }
 
@@ -177,11 +178,16 @@ void VCAMSetupPreviewLayer(AVCaptureVideoPreviewLayer *layer) {
     if (!layer) return;
     if ([[layer sublayers] containsObject:g_previewLayer]) return;
 
+    VCAM_LOG(@"VCAMSetupPreviewLayer 触发, layer=%@ sublayers=%lu",
+             NSStringFromClass([layer class]), (unsigned long)layer.sublayers.count);
+
     g_previewLayer = [[AVSampleBufferDisplayLayer alloc] init];
+    g_previewLayer.zPosition = 9999;
     g_maskLayer = [CALayer new];
     g_maskLayer.backgroundColor = [UIColor blackColor].CGColor;
-    [layer insertSublayer:g_maskLayer above:layer.sublayers.lastObject];
-    [layer insertSublayer:g_previewLayer above:g_maskLayer];
+    g_maskLayer.zPosition = 9998;
+    [layer addSublayer:g_maskLayer];
+    [layer addSublayer:g_previewLayer];
 
     dispatch_async(dispatch_get_main_queue(), ^{
         g_previewLayer.frame = layer.bounds;
@@ -190,13 +196,13 @@ void VCAMSetupPreviewLayer(AVCaptureVideoPreviewLayer *layer) {
 
     static CADisplayLink *displayLink = nil;
     if (displayLink == nil) {
-        displayLink = [CADisplayLink displayLinkWithTarget:layer selector:@selector(step:)];
-        [displayLink addToRunLoop:[NSRunLoop currentRunLoop] forMode:NSRunLoopCommonModes];
+        displayLink = [CADisplayLink displayLink-WithTarget:layer selector:@selector(step:)];
+        [displayLink addToRunLoop:[ (NSRunLoop currentRunLoop] forMode:NSRunLoopCommonModes];
     }
 }
 
-%hook AVCaptureVideoPreviewLayer
-- (void)addSublayer:(CALayer *)layer {
+%voidhook AVCaptureVideoPreviewLayer
+- (void)addSublayer:(CALayer)set *)layer {
     %orig;
     VCAMSetupPreviewLayer(self);
 }
@@ -392,6 +398,8 @@ void VCAMSetupPreviewLayer(AVCaptureVideoPreviewLayer *layer) {
 %end
 
 %ctor {
+    VCAM_LOG_STARTUP();
+
     g_isMirroredMark = [NSString stringWithUTF8String:jbroot("/var/mobile/Library/Caches/vcam_is_mirrored_mark")];
     g_tempFile = [NSString stringWithUTF8String:jbroot("/var/mobile/Library/Caches/temp.mov")];
 
