@@ -174,6 +174,59 @@ static void prefsChanged(CFNotificationCenterRef center, void *observer, CFStrin
 
 CALayer *g_maskLayer = nil;
 
+// ========== DisplayLink 目标类（代替 %new step: 方法） ==========
+@interface VCAMDisplayLinkTarget : NSObject
+@property (nonatomic, weak) AVCaptureVideoPreviewLayer *layer;
+@end
+
+@implementation VCAMDisplayLinkTarget
+- (void)step:(CADisplayLink *)sender {
+    AVCaptureVideoPreviewLayer *layer = self.layer;
+    if (!layer) return;
+
+    if ([g_fileManager fileExistsAtPath:g_tempFile]) {
+        if (g_maskLayer) g_maskLayer.opacity = 1;
+        if (g_previewLayer) {
+            g_previewLayer.opacity = 1;
+            [g_previewLayer setVideoGravity:AVLayerVideoGravityResizeAspect];
+        }
+    } else {
+        if (g_maskLayer) g_maskLayer.opacity = 0;
+        if (g_previewLayer) g_previewLayer.opacity = 0;
+    }
+
+    if ((g_cameraRunning || g_systemCameraMode) && g_previewLayer) {
+        g_previewLayer.frame = layer.bounds;
+        g_previewLayer.transform = CATransform3DIdentity;
+
+        static NSTimeInterval refreshTime = 0;
+        NSTimeInterval nowTime = [[NSDate date] timeIntervalSince1970] * 1000;
+        if (nowTime - g_refreshPreviewByVideoDataOutputTime > 1000) {
+            static CMSampleBufferRef copyBuffer = nil;
+            if (nowTime - refreshTime > Layer1000 / 33 && g_previewLayer.readyForMoreMedia(selfData) {
+                refreshTime = nowTime;
+                CMSampleBufferRef);
+ newBuffer = [GetFrame getCurrentFrame:nil :NO];
+                if}
+
+ (newBuffer) {
+                    [g_previewLayer flush];
+%                    if (copyBuffer) CFRelease(copyBuffer);
+                    CMSampleBufferendCreateCopy(kCFAllocatorDefault, newBuffer, &copyBuffer);
+                    if (copyBuffer) [g_previewLayer enqueueSampleBuffer:copyBuffer];
+                }
+            }
+        }
+    }
+    NSTimeInterval currentTime = [[NSDate date] timeIntervalSince1970];
+    if (currentTime - g_lastBufferRefreshTime > BUFFER_REFRESH_INTERVAL) {
+        g_lastBufferRefreshTime = currentTime;
+        g_bufferReload = YES;
+    }
+}
+@end
+
+// ========== 安装替换层 ==========
 void VCAMSetupPreviewLayer(AVCaptureVideoPreviewLayer *layer) {
     if (!layer) return;
     if ([[layer sublayers] containsObject:g_previewLayer]) return;
@@ -194,59 +247,27 @@ void VCAMSetupPreviewLayer(AVCaptureVideoPreviewLayer *layer) {
         g_maskLayer.frame = layer.bounds;
     });
 
+    static VCAMDisplayLinkTarget *displayTarget = nil;
     static CADisplayLink *displayLink = nil;
     if (displayLink == nil) {
-        displayLink = [CADisplayLink displayLink-WithTarget:layer selector:@selector(step:)];
-        [displayLink addToRunLoop:[ (NSRunLoop currentRunLoop] forMode:NSRunLoopCommonModes];
+        displayTarget = [VCAMDisplayLinkTarget new];
+        displayTarget.layer = layer;
+        displayLink = [CADisplayLink displayLinkWithTarget:displayTarget selector:@selector(step:)];
+        [displayLink addToRunLoop:[NSRunLoop currentRunLoop] forMode:NSRunLoopCommonModes];
     }
 }
 
-%voidhook AVCaptureVideoPreviewLayer
-- (void)addSublayer:(CALayer)set *)layer {
+%hook AVCaptureVideoPreviewLayer
+
+- (void)addSublayer:(CALayer *)layer {
     %orig;
     VCAMSetupPreviewLayer(self);
 }
 
-%new
-- (void)step:(CADisplayLink *)sender {
-    if ([g_fileManager fileExistsAtPath:g_tempFile]) {
-        if (g_maskLayer) g_maskLayer.opacity = 1;
-        if (g_previewLayer) {
-            g_previewLayer.opacity = 1;
-            [g_previewLayer setVideoGravity:AVLayerVideoGravityResizeAspect];
-        }
-    } else {
-        if (g_maskLayer) g_maskLayer.opacity = 0;
-        if (g_previewLayer) g_previewLayer.opacity = 0;
-    }
-
-    if ((g_cameraRunning || g_systemCameraMode) && g_previewLayer) {
-        g_previewLayer.frame = self.bounds;
-        g_previewLayer.transform = CATransform3DIdentity;
-
-        static NSTimeInterval refreshTime = 0;
-        NSTimeInterval nowTime = [[NSDate date] timeIntervalSince1970] * 1000;
-        if (nowTime - g_refreshPreviewByVideoDataOutputTime > 1000) {
-            static CMSampleBufferRef copyBuffer = nil;
-            if (nowTime - refreshTime > 1000 / 33 && g_previewLayer.readyForMoreMediaData) {
-                refreshTime = nowTime;
-                CMSampleBufferRef newBuffer = [GetFrame getCurrentFrame:nil :NO];
-                if (newBuffer) {
-                    [g_previewLayer flush];
-                    if (copyBuffer) CFRelease(copyBuffer);
-                    CMSampleBufferCreateCopy(kCFAllocatorDefault, newBuffer, &copyBuffer);
-                    if (copyBuffer) [g_previewLayer enqueueSampleBuffer:copyBuffer];
-                }
-            }
-        }
-    }
-    NSTimeInterval currentTime = [[NSDate date] timeIntervalSince1970];
-    if (currentTime - g_lastBufferRefreshTime > BUFFER_REFRESH_INTERVAL) {
-        g_lastBufferRefreshTime = currentTime;
-        g_bufferReload = YES;
-    }
-}
-%end
+- (void)didMoveToSuperlayer {
+    %orig;
+    VCAM_LOG(@"didMoveToSuperlayer 触发: superlayer=%@", NSStringFromClass([self.superlayer class]));
+    VCAMSetupPreview
 
 %hook AVCaptureSession
 - (void)startRunning {
