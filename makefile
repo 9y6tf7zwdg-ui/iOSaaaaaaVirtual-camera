@@ -1,11 +1,11 @@
-TARGET := iphone:clang:latest:11.0
+TARGET := iphone:clang:latest:16.0
 ARCHS = arm64
 INSTALL_TARGET_PROCESSES = SpringBoard Camera
 
 include $(THEOS)/makefiles/common.mk
 
 TWEAK_NAME = VCAM
-THEOS_PACKAGE_SCHEME = rootless
+THEOS_PACKAGE_SCHEME = roothide
 VCAM_FILES = Tweak.x
 VCAM_CFLAGS = -fobjc-arc -Wno-unused-variable -Wno-deprecated-declarations -Wno-error
 
