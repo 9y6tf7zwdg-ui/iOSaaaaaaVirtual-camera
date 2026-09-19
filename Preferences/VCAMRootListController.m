@@ -143,7 +143,6 @@
             return;
         }
 
-        // 用系统原生的 UIVideoEditorController 打开剪辑界面
         dispatch_async(dispatch_get_main_queue(), ^{
             [self openNativeEditorWithPath:tempCopyPath];
         });
@@ -154,14 +153,12 @@
 
 - (void)openNativeEditorWithPath:(NSString *)path {
     if (![UIVideoEditorController canEditVideoAtPath:path]) {
-        // 如果系统不支持（比如视频格式特殊），直接使用原视频
         [self finalizeVideoWithPath:path];
         return;
     }
 
     UIVideoEditorController *editor = [[UIVideoEditorController alloc] init];
     editor.videoPath = path;
-    // 视频最大时长，设大一些让用户自由裁剪（单位：秒）
     editor.videoMaximumDuration = 3600.0;
     editor.videoQuality = UIImagePickerControllerQualityTypeHigh;
     editor.delegate = self;
@@ -180,7 +177,6 @@
 
 - (void)videoEditorController:(UIVideoEditorController *)editor didFailWithError:(NSError *)error {
     [editor dismissViewControllerAnimated:YES completion:^{
-        NSLog(@"[VCAM] 视频剪辑失败: %@", error);
         [self showAlertWithTitle:@"VCAM" message:[NSString stringWithFormat:@"剪辑失败：%@", error.localizedDescription ?: @"未知错误"]];
     }];
 }
@@ -189,31 +185,83 @@
     [editor dismissViewControllerAnimated:YES completion:nil];
 }
 
-#pragma mark - 保存视频到目标路径
+#pragma mark - 保存视频（含方向校正）
 
 - (void)finalizeVideoWithPath:(NSString *)sourcePath {
-    NSFileManager *fm = [NSFileManager defaultManager];
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-        if ([fm fileExistsAtPath:self.tempFilePath]) {
-            [fm removeItemAtPath:self.tempFilePath error:nil];
+        AVAsset *asset = [AVAsset assetWithURL:[NSURL fileURLWithPath:sourcePath]];
+        AVAssetTrack *videoTrack = [[asset tracksWithMediaType:AVMediaTypeVideo] firstObject];
+
+        if (!videoTrack) {
+            [self copyToTempPath:sourcePath];
+            return;
         }
-        NSError *moveError = nil;
-        if ([fm moveItemAtPath:sourcePath toPath:self.tempFilePath error:&moveError]) {
-            [fm createDirectoryAtPath:[NSString stringWithFormat:@"%@.new", self.tempFilePath]
-                withIntermediateDirectories:YES attributes:nil error:nil];
-            dispatch_async(dispatch_get_main_queue(), ^{
-                [self showAlertWithTitle:@"VCAM" message:@"视频已加载，打开相机即可看到替换效果"];
-                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
-                               dispatch_get_main_queue(), ^{
-                    [fm removeItemAtPath:[NSString stringWithFormat:@"%@.new", self.tempFilePath] error:nil];
-                });
-            });
-        } else {
-            dispatch_async(dispatch_get_main_queue(), ^{
-                [self showAlertWithTitle:@"VCAM" message:[NSString stringWithFormat:@"保存视频失败：%@", moveError.localizedDescription]];
-            });
+
+        CGAffineTransform transform = videoTrack.preferredTransform;
+        if (CGAffineTransformIsIdentity(transform)) {
+            [self copyToTempPath:sourcePath];
+            return;
         }
+
+        // 需要做方向校正：把 preferredTransform 烘焙进像素数据
+        CGSize naturalSize = videoTrack.naturalSize;
+        CGSize displaySize = CGSizeApplyAffineTransform(naturalSize, transform);
+        displaySize = CGSizeMake(fabs(displaySize.width), fabs(displaySize.height));
+
+        AVMutableVideoComposition *videoComposition = [AVMutableVideoComposition videoComposition];
+        videoComposition.renderSize = displaySize;
+        videoComposition.frameDuration = CMTimeMake(1, 30);
+
+        AVMutableVideoCompositionInstruction *instruction = [AVMutableVideoCompositionInstruction videoCompositionInstruction];
+        instruction.timeRange = CMTimeRangeMake(kCMTimeZero, asset.duration);
+
+        AVMutableVideoCompositionLayerInstruction *layerInstruction = [AVMutableVideoCompositionLayerInstruction videoCompositionLayerInstructionWithAssetTrack:videoTrack];
+        [layerInstruction setTransform:transform atTime:kCMTimeZero];
+
+        instruction.layerInstructions = @[layerInstruction];
+        videoComposition.instructions = @[instruction];
+
+        NSString *exportPath = [NSTemporaryDirectory() stringByAppendingPathComponent:@"vcam_oriented.mov"];
+        NSFileManager *fm = [NSFileManager defaultManager];
+        if ([fm fileExistsAtPath:exportPath]) [fm removeItemAtPath:exportPath error:nil];
+
+        AVAssetExportSession *exportSession = [[AVAssetExportSession alloc] initWithAsset:asset presetName:AVAssetExportPresetHighestQuality];
+        exportSession.outputURL = [NSURL fileURLWithPath:exportPath];
+        exportSession.outputFileType = AVFileTypeQuickTimeMovie;
+        exportSession.videoComposition = videoComposition;
+        exportSession.shouldOptimizeForNetworkUse = NO;
+
+        [exportSession exportAsynchronouslyWithCompletionHandler:^{
+            if (exportSession.status == AVAssetExportSessionStatusCompleted) {
+                [self copyToTempPath:exportPath];
+            } else {
+                NSLog(@"[VCAM] 方向校正导出失败: %@", exportSession.error);
+                [self copyToTempPath:sourcePath];
+            }
+        }];
     });
+}
+
+- (void)copyToTempPath:(NSString *)sourcePath {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    if ([fm fileExistsAtPath:self.tempFilePath]) {
+        [fm removeItemAtPath:self.tempFilePath error:nil];
+    }
+    NSError *copyError = nil;
+    if ([fm copyItemAtPath:sourcePath toPath:self.tempFilePath error:&copyError]) {
+        [fm createDirectoryAtPath:[NSString stringWithFormat:@"%@.new", self.tempFilePath]
+            withIntermediateDirectories:YES attributes:nil error:nil];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [self showAlertWithTitle:@"VCAM" message:@"视频已加载，打开相机即可看到替换效果"];
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                [fm removeItemAtPath:[NSString stringWithFormat:@"%@.new", self.tempFilePath] error:nil];
+            });
+        });
+    } else {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [self showAlertWithTitle:@"VCAM" message:[NSString stringWithFormat:@"保存视频失败：%@", copyError.localizedDescription]];
+        });
+    }
 }
 
 #pragma mark - 下载视频
@@ -241,20 +289,11 @@
                 [progressAlert dismissViewControllerAnimated:YES completion:nil];
             });
             if (urlData) {
-                NSString *tempPath = [NSString stringWithFormat:@"%@.downloading.mov", self.tempFilePath];
+                NSString *tempPath = [NSTemporaryDirectory() stringByAppendingPathComponent:@"vcam_download.mov"];
                 if ([urlData writeToFile:tempPath atomically:YES]) {
-                    AVAsset *asset = [AVAsset assetWithURL:[NSURL URLWithString:[NSString stringWithFormat:@"file://%@", tempPath]]];
+                    AVAsset *asset = [AVAsset assetWithURL:[NSURL fileURLWithPath:tempPath]];
                     if (asset.playable) {
-                        NSFileManager *fm = [NSFileManager defaultManager];
-                        if ([fm fileExistsAtPath:self.tempFilePath]) {
-                            [fm removeItemAtPath:self.tempFilePath error:nil];
-                        }
-                        [fm moveItemAtPath:tempPath toPath:self.tempFilePath error:nil];
-                        [fm createDirectoryAtPath:[NSString stringWithFormat:@"%@.new", self.tempFilePath] withIntermediateDirectories:YES attributes:nil error:nil];
-                        dispatch_async(dispatch_get_main_queue(), ^{
-                            [self showAlertWithTitle:@"VCAM" message:@"下载完成"];
-                            [fm removeItemAtPath:[NSString stringWithFormat:@"%@.new", self.tempFilePath] error:nil];
-                        });
+                        [self finalizeVideoWithPath:tempPath];
                     } else {
                         [[NSFileManager defaultManager] removeItemAtPath:tempPath error:nil];
                         dispatch_async(dispatch_get_main_queue(), ^{
