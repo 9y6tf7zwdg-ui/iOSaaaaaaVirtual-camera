@@ -104,14 +104,6 @@
             <key>action</key>
             <string>toggleMirrorFix</string>
         </dict>
-        <dict>
-            <key>cell</key>
-            <string>PSButtonCell</string>
-            <key>label</key>
-            <string>查看调试日志</string>
-            <key>action</key>
-            <string>showDebugLog</string>
-        </dict>
     </array>
 </dict>
 </plist>
