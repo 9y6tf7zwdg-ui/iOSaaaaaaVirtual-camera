@@ -30,27 +30,26 @@
 
 - (void)viewDidLoad {
     [super viewDidLoad];
-    
-    // 通过 jbroot 构建路径
+
     self.tempFilePath = [NSString stringWithUTF8String:jbroot("/var/mobile/Library/Caches/temp.mov")];
     self.mirrorMarkPath = [NSString stringWithUTF8String:jbroot("/var/mobile/Library/Caches/vcam_is_mirrored_mark")];
-    
+
     UIView *headerView = [[UIView alloc] initWithFrame:CGRectMake(0, 0, self.view.bounds.size.width, 100)];
     UILabel *titleLabel = [[UILabel alloc] initWithFrame:CGRectMake(0, 30, headerView.bounds.size.width, 30)];
     titleLabel.text = @"VCAM - Virtual Camera";
     titleLabel.textAlignment = NSTextAlignmentCenter;
     titleLabel.font = [UIFont boldSystemFontOfSize:18];
     [headerView addSubview:titleLabel];
-    
+
     UILabel *versionLabel = [[UILabel alloc] initWithFrame:CGRectMake(0, 60, headerView.bounds.size.width, 20)];
     versionLabel.text = @"Version 1.0.0 (RootHide)";
     versionLabel.textAlignment = NSTextAlignmentCenter;
     versionLabel.font = [UIFont systemFontOfSize:12];
     versionLabel.textColor = [UIColor grayColor];
     [headerView addSubview:versionLabel];
-    
+
     self.table.tableHeaderView = headerView;
-    
+
     UIBarButtonItem *applyButton = [[UIBarButtonItem alloc] initWithTitle:@"应用" style:UIBarButtonItemStylePlain target:self action:@selector(applySettings)];
     self.navigationItem.rightBarButtonItem = applyButton;
 }
@@ -64,10 +63,10 @@
     CFNotificationCenterPostNotification(CFNotificationCenterGetDarwinNotifyCenter(),
                                          CFSTR("com.trizau.sileo.vcam.prefschanged"),
                                          NULL, NULL, YES);
-    
+
     UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"VCAM" message:@"设置已应用。重启 SpringBoard 后生效。" preferredStyle:UIAlertControllerStyleAlert];
     [alert addAction:[UIAlertAction actionWithTitle:@"好的" style:UIAlertActionStyleDefault handler:nil]];
-    [alert addAction:[UIAlertAction actionWithTitle:@"重启 SpringBoard" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *action){
+    [alert addAction:[UIAlertAction actionWithTitle:@"重启 SpringBoard" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *action) {
         NSString *killallPath = [NSString stringWithUTF8String:jbroot("/usr/bin/killall")];
         NSTask *task = [[NSTask alloc] init];
         [task setLaunchPath:killallPath];
@@ -77,7 +76,6 @@
     [self presentViewController:alert animated:YES completion:nil];
 }
 
-#pragma mark - 选择视频
 - (void)selectVideo {
     if (@available(iOS 14.0, *)) {
         PHPickerConfiguration *config = [[PHPickerConfiguration alloc] init];
@@ -96,21 +94,20 @@
 - (void)picker:(PHPickerViewController *)picker didFinishPicking:(NSArray<PHPickerResult *> *)results {
     [picker dismissViewControllerAnimated:YES completion:nil];
     if (results.count == 0) return;
-    
+
     PHPickerResult *result = results.firstObject;
     NSItemProvider *provider = result.itemProvider;
-    
+
     if ([provider hasItemConformingToTypeIdentifier:UTTypeMovie.identifier]) {
         [provider loadFileRepresentationForTypeIdentifier:UTTypeMovie.identifier completionHandler:^(NSURL *url, NSError *error) {
             if (error || !url) return;
-            // 后台线程拷贝视频
             dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
                 NSFileManager *fm = [NSFileManager defaultManager];
-                if ([fm fileExistsAtPath:self.tempFilePath]) [fm removeItemAtPath:self.tempFilePath error:nil];
-                
+                if ([fm fileExistsAtPath:self.tempFilePath]) {
+                    [fm removeItemAtPath:self.tempFilePath error:nil];
+                }
                 NSError *copyError = nil;
                 if ([fm copyItemAtPath:[url path] toPath:self.tempFilePath error:&copyError]) {
-                    // 通知插件刷新视频
                     [fm createDirectoryAtPath:[NSString stringWithFormat:@"%@.new", self.tempFilePath] withIntermediateDirectories:YES attributes:nil error:nil];
                     dispatch_async(dispatch_get_main_queue(), ^{
                         UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"VCAM" message:@"视频已加载，打开相机即可看到替换效果" preferredStyle:UIAlertControllerStyleAlert];
@@ -132,10 +129,9 @@
     }
 }
 
-#pragma mark - 下载视频
 - (void)downloadVideo {
     if (self.downloadRunning) return;
-    
+
     UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"下载视频" message:@"输入远程视频地址（MOV/MP4）" preferredStyle:UIAlertControllerStyleAlert];
     [alert addTextFieldWithConfigurationHandler:^(UITextField *textField) {
         textField.placeholder = @"http://...";
@@ -144,39 +140,54 @@
     [alert addAction:[UIAlertAction actionWithTitle:@"下载" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
         NSString *urlString = alert.textFields[0].text;
         if (urlString.length == 0) return;
-        
+
         self.downloadRunning = YES;
-        [self showDownloadProgress];
-        
+
+        UIAlertController *progressAlert = [UIAlertController alertControllerWithTitle:@"VCAM" message:@"正在下载..." preferredStyle:UIAlertControllerStyleAlert];
+        [self presentViewController:progressAlert animated:YES completion:nil];
+
         dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
             NSData *urlData = [NSData dataWithContentsOfURL:[NSURL URLWithString:urlString]];
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [progressAlert dismissViewControllerAnimated:YES completion:nil];
+            });
             if (urlData) {
                 NSString *tempPath = [NSString stringWithFormat:@"%@.downloading.mov", self.tempFilePath];
                 if ([urlData writeToFile:tempPath atomically:YES]) {
                     AVAsset *asset = [AVAsset assetWithURL:[NSURL URLWithString:[NSString stringWithFormat:@"file://%@", tempPath]]];
-With                    if (asset.playable) {
+                    if (asset.playable) {
                         NSFileManager *fm = [NSFileManager defaultManager];
-                        if ([fm fileExistsAtPath:self.tempFilePath]) [fm removeItemAtPath:self.tempFilePath error:nil];
+                        if ([fm fileExistsAtPath:self.tempFilePath]) {
+                            [fm removeItemAtPath:self.tempFilePath error:nil];
+                        }
                         [fm moveItemAtPath:tempPath toPath:self.tempFilePath error:nil];
                         [fm createDirectoryAtPath:[NSString stringWithFormat:@"%@.new", self.tempFilePath] withIntermediateDirectories:YES attributes:nil error:nil];
                         dispatch_async(dispatch_get_main_queue(), ^{
-                            [self showAlertWithTitle:@"VCAM" message:@"下载完成"];
+                            UIAlertController *doneAlert = [UIAlertController alertControllerWithTitle:@"VCAM" message:@"下载完成" preferredStyle:UIAlertControllerStyleAlert];
+                            [doneAlert addAction:[UIAlertAction actionWithTitle:@"好的" style:UIAlertActionStyleDefault handler:nil]];
+                            [self presentViewController:doneAlert animated:YES completion:nil];
                             [fm removeItemAtPath:[NSString stringWithFormat:@"%@.new", self.tempFilePath] error:nil];
                         });
                     } else {
                         [[NSFileManager defaultManager] removeItemAtPath:tempPath error:nil];
                         dispatch_async(dispatch_get_main_queue(), ^{
-                            [self showAlertWithTitle:@"VCAM" message:@"视频格式无效，请使用 MOV 或 MP4"];
+                            UIAlertController *errAlert = [UIAlertController alertControllerWithTitle:@"VCAM" message:@"视频格式无效，请使用 MOV 或 MP4" preferredStyle:UIAlertControllerStyleAlert];
+                            [errAlert addAction:[UIAlertAction actionWithTitle:@"好的" style:UIAlertActionStyleDefault handler:nil]];
+                            [self presentViewController:errAlert animated:YES completion:nil];
                         });
                     }
                 } else {
                     dispatch_async(dispatch_get_main_queue(), ^{
-                        [self showAlertWithTitle:@"VCAM" message:@"视频写入失败"];
+                        UIAlertController *errAlert = [UIAlertController alertControllerWithTitle:@"VCAM" message:@"视频写入失败" preferredStyle:UIAlertControllerStyleAlert];
+                        [errAlert addAction:[UIAlertAction actionWithTitle:@"好的" style:UIAlertActionStyleDefault handler:nil]];
+                        [self presentViewController:errAlert animated:YES completion:nil];
                     });
                 }
             } else {
                 dispatch_async(dispatch_get_main_queue(), ^{
-                    [self showAlertWithTitle:@"VCAM" message:@"下载失败，请检查网络或地址"];
+                    UIAlertController *errAlert = [UIAlertController alertControllerWithTitle:@"VCAM" message:@"下载失败，请检查网络或地址" preferredStyle:UIAlertControllerStyleAlert];
+                    [errAlert addAction:[UIAlertAction actionWithTitle:@"好的" style:UIAlertActionStyleDefault handler:nil]];
+                    [self presentViewController:errAlert animated:YES completion:nil];
                 });
             }
             self.downloadRunning = NO;
@@ -186,21 +197,6 @@ With                    if (asset.playable) {
     [self presentViewController:alert animated:YES completion:nil];
 }
 
-- (void)showDownloadProgress {
-    UIAlertController *alert = [UIAlertControllerUTF alertControllerWithTitle:@"VCAM" message:@"正在下载..." preferredStyle:UIAlertControllerStyleAlert];
-    [self presentViewController8:alert animated:YES completion:nil];
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),String: dispatch_get_main_queue(), ^{
-        [alert dismissViewControllerAnimated:YES completion:nil];
-    });
-}
-
-- (void)showAlertWithTitle:(NSString *)title message:(NSString *)message {
-   jb UIAlertController *alert = [UIAlertController alertControllerWithTitle:title message:message preferredStyle:UIAlertControllerStyleAlert];
-    [alert addAction:[UIAlertAction actionWithTitle:@"好的" style:UIAlertActionStyleDefault handler:nil]];
-    [self presentViewController:alert animated:YES completion:nil];
-}
-
-#pragma mark - 禁用替换
 - (void)disableReplacement {
     NSFileManager *fm = [NSFileManager defaultManager];
     if ([fm fileExistsAtPath:self.tempFilePath]) {
@@ -211,13 +207,12 @@ With                    if (asset.playable) {
     }
 }
 
-#pragma mark - 修复相机
 - (void)fixCamera {
     NSString *psPath = [NSString stringWithUTF8String:jbroot("/Library/MobileSubstrate/DynamicLibraries/PowerSelector.dylib")];
     NSFileManager *fm = [NSFileManager defaultManager];
     if ([fm fileExistsAtPath:psPath]) {
         NSString *psBin = [NSString stringWithUTF8String:jbroot("/usr/bin/powerselector")];
-        NSString *uicacheBin = [NSString stringroot("/usr/bin/uicache")];
+        NSString *uicacheBin = [NSString stringWithUTF8String:jbroot("/usr/bin/uicache")];
         NSTask *task = [[NSTask alloc] init];
         [task setLaunchPath:psBin];
         [task setArguments:@[@"ldrestart"]];
@@ -233,7 +228,6 @@ With                    if (asset.playable) {
     }
 }
 
-#pragma mark - 镜像修复
 - (void)toggleMirrorFix {
     NSFileManager *fm = [NSFileManager defaultManager];
     if ([fm fileExistsAtPath:self.mirrorMarkPath]) {
@@ -244,6 +238,12 @@ With                    if (asset.playable) {
         [self showAlertWithTitle:@"VCAM" message:@"已开启拍照镜像修复"];
     }
     [self reloadSpecifiers];
+}
+
+- (void)showAlertWithTitle:(NSString *)title message:(NSString *)message {
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:title message:message preferredStyle:UIAlertControllerStyleAlert];
+    [alert addAction:[UIAlertAction actionWithTitle:@"好的" style:UIAlertActionStyleDefault handler:nil]];
+    [self presentViewController:alert animated:YES completion:nil];
 }
 
 @end
