@@ -34,11 +34,6 @@
     %orig;
 }
 
-- (void)didMoveToWindow {
-    VCAM_LOG(@"PreviewLayer didMoveToWindow, window=%@", NSStringFromClass([self.window class]));
-    %orig;
-}
-
 - (void)layoutSublayers {
     VCAM_LOG(@"PreviewLayer layoutSublayers, sublayers.count=%lu", (unsigned long)self.sublayers.count);
     for (CALayer *sub in self.sublayers) {
@@ -92,14 +87,13 @@ static void VCAMDumpLayerTree(CALayer *layer, int depth) {
     }
 }
 
-// 定时 dump 当前活跃窗口的视图层级（只在"相机"进程中运行）
+// 定时 dump 当前活跃窗口的视图层级
 static void VCAMStartPeriodicDump(void) {
     if (g_analyzerRunning) return;
     g_analyzerRunning = YES;
 
     dispatch_async(dispatch_get_main_queue(), ^{
         [NSTimer scheduledTimerWithTimeInterval:2.0 repeats:YES block:^(NSTimer *timer) {
-            // 只 dump 最顶层的窗口
             UIWindow *keyWindow = nil;
             for (UIWindow *w in UIApplication.sharedApplication.windows) {
                 if (w.isKeyWindow) { keyWindow = w; break; }
@@ -171,7 +165,7 @@ static void VCAMStartPeriodicDump(void) {
 
 %end
 
-#pragma mark - 6. 诊断 AVCaptureDeviceInput / AVCaptureDevice
+#pragma mark - 6. 诊断 AVCaptureDevice
 
 %hook AVCaptureDevice
 
@@ -182,7 +176,7 @@ static void VCAMStartPeriodicDump(void) {
 
 %end
 
-#pragma mark - 7. 诊断 CALayer 的 insertSublayer 系列方法（谁在往 preview 上加层）
+#pragma mark - 7. 诊断 CALayer 的 insertSublayer 系列方法
 
 %hook CALayer
 
