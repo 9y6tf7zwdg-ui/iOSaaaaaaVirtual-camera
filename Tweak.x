@@ -43,7 +43,7 @@ static BOOL g_isIOS15OrLater = NO;
 
 // 帧率节流
 static NSTimeInterval g_lastRotationTime = 0;
-static const NSTimeInterval ROTATION_THROTTLE = 1.0 / 15.0;
+static const NSTimeInterval ROTATION_THROTTLE = 1.0 / 20.0;
 
 NSString *g_isMirroredMark = nil;
 NSString *g_tempFile = nil;
@@ -86,106 +86,63 @@ static NSString *rotationLabel(CGFloat rad) {
     return @"0°";
 }
 
-// ===== vImage 旋转 + 缩放到目标尺寸 =====
-static CVPixelBufferRef rotateAndScalePixelBuffer(CVPixelBufferRef src, CGFloat angleRadians, size_t targetW, size_t targetH) {
-    if (!src || targetW == 0 || targetH == 0) return NULL;
+// ===== vImage 只做旋转（不缩放） =====
+static CVPixelBufferRef rotatePixelBufferOnly(CVPixelBufferRef src, CGFloat angleRadians) {
+    if (!src) return NULL;
+    if (fabs(angleRadians) < 0.001) return CVPixelBufferRetain(src);
 
     size_t w = CVPixelBufferGetWidth(src);
     size_t h = CVPixelBufferGetHeight(src);
 
-    // 步骤 1：先按用户角度旋转（如果需要）
-    CVPixelBufferRef rotated = NULL;
-    size_t rotW = w, rotH = h;
+    BOOL swap = (fabs(angleRadians - M_PI_2) < 0.01 || fabs(angleRadians + M_PI_2) < 0.01);
+    size_t newW = swap ? h : w;
+    size_t newH = swap ? w : h;
 
-    BOOL needsRotate = fabs(angleRadians) > 0.001;
-    if (needsRotate) {
-        BOOL swap = (fabs(angleRadians - M_PI_2) < 0.01 || fabs(angleRadians + M_PI_2) < 0.01);
-        rotW = swap ? h : w;
-        rotH = swap ? w : h;
-
-        NSDictionary *opts = @{(id)kCVPixelBufferIOSurfacePropertiesKey: @{}};
-        CVReturn ret = CVPixelBufferCreate(kCFAllocatorDefault, rotW, rotH,
-                                            kCVPixelFormatType_32BGRA,
-                                            (__bridge CFDictionaryRef)opts, &rotated);
-        if (ret != kCVReturnSuccess || !rotated) {
-            rotated = NULL;
-            rotW = w;
-            rotH = h;
-        } else {
-            CVPixelBufferLockBaseAddress(src, kCVPixelBufferLock_ReadOnly);
-            CVPixelBufferLockBaseAddress(rotated, 0);
-            vImage_Buffer sBuf = {
-                .data = CVPixelBufferGetBaseAddress(src),
-                .height = h, .width = w,
-                .rowBytes = CVPixelBufferGetBytesPerRow(src)
-            };
-            vImage_Buffer dBuf = {
-                .data = CVPixelBufferGetBaseAddress(rotated),
-                .height = rotH, .width = rotW,
-                .rowBytes = CVPixelBufferGetBytesPerRow(rotated)
-            };
-            Pixel_8888 bg = {0, 0, 0, 0};
-            vImage_Error err = kvImageNoError;
-            if (fabs(angleRadians - M_PI_2) < 0.01) {
-                err = vImageRotate90_ARGB8888(&sBuf, &dBuf, kRotate90DegreesClockwise, bg, kvImageNoFlags);
-            } else if (fabs(angleRadians + M_PI_2) < 0.01) {
-                err = vImageRotate90_ARGB8888(&sBuf, &dBuf, kRotate270DegreesClockwise, bg, kvImageNoFlags);
-            } else if (fabs(fabs(angleRadians) - M_PI) < 0.01) {
-                err = vImageRotate90_ARGB8888(&sBuf, &dBuf, kRotate180DegreesClockwise, bg, kvImageNoFlags);
-            }
-            CVPixelBufferUnlockBaseAddress(src, kCVPixelBufferLock_ReadOnly);
-            CVPixelBufferUnlockBaseAddress(rotated, 0);
-            if (err != kvImageNoError) {
-                CVPixelBufferRelease(rotated);
-                rotated = NULL;
-                rotW = w;
-                rotH = h;
-            }
-        }
-    }
-
-    CVPixelBufferRef source = rotated ? rotated : src;
-    size_t srcW = rotW, srcH = rotH;
-
-    // 步骤 2：缩放到目标尺寸
-    CVPixelBufferRef result = NULL;
+    CVPixelBufferRef dst = NULL;
     NSDictionary *opts = @{(id)kCVPixelBufferIOSurfacePropertiesKey: @{}};
-    CVReturn ret = CVPixelBufferCreate(kCFAllocatorDefault, targetW, targetH,
+    CVReturn ret = CVPixelBufferCreate(kCFAllocatorDefault, newW, newH,
                                         kCVPixelFormatType_32BGRA,
-                                        (__bridge CFDictionaryRef)opts, &result);
-    if (ret != kCVReturnSuccess || !result) {
-        if (rotated) CVPixelBufferRelease(rotated);
-        return CVPixelBufferRetain(src);
+                                        (__bridge CFDictionaryRef)opts, &dst);
+    if (ret != kCVReturnSuccess || !dst) return CVPixelBufferRetain(src);
+
+    CVPixelBufferLockBaseAddress(src, kCVPixelBufferLock_ReadOnly);
+    CVPixelBufferLockBaseAddress(dst, 0);
+
+    vImage_Buffer srcBuf = {
+        .data = CVPixelBufferGetBaseAddress(src),
+        .height = h,
+        .width = w,
+        .rowBytes = CVPixelBufferGetBytesPerRow(src)
+    };
+    vImage_Buffer dstBuf = {
+        .data = CVPixelBufferGetBaseAddress(dst),
+        .height = newH,
+        .width = newW,
+        .rowBytes = CVPixelBufferGetBytesPerRow(dst)
+    };
+
+    Pixel_8888 bg = {0, 0, 0, 0};
+    vImage_Error err = kvImageNoError;
+
+    if (fabs(angleRadians - M_PI_2) < 0.01) {
+        err = vImageRotate90_ARGB8888(&srcBuf, &dstBuf, kRotate90DegreesClockwise, bg, kvImageNoFlags);
+    } else if (fabs(angleRadians + M_PI_2) < 0.01) {
+        err = vImageRotate90_ARGB8888(&srcBuf, &dstBuf, kRotate270DegreesClockwise, bg, kvImageNoFlags);
+    } else if (fabs(fabs(angleRadians) - M_PI) < 0.01) {
+        err = vImageRotate90_ARGB8888(&srcBuf, &dstBuf, kRotate180DegreesClockwise, bg, kvImageNoFlags);
     }
 
-    CVPixelBufferLockBaseAddress(source, kCVPixelBufferLock_ReadOnly);
-    CVPixelBufferLockBaseAddress(result, 0);
-
-    vImage_Buffer sBuf = {
-        .data = CVPixelBufferGetBaseAddress(source),
-        .height = srcH, .width = srcW,
-        .rowBytes = CVPixelBufferGetBytesPerRow(source)
-    };
-    vImage_Buffer dBuf = {
-        .data = CVPixelBufferGetBaseAddress(result),
-        .height = targetH, .width = targetW,
-        .rowBytes = CVPixelBufferGetBytesPerRow(result)
-    };
-
-    vImage_Error err = vImageScale_ARGB8888(&sBuf, &dBuf, NULL, kvImageHighQualityResampling);
-
-    CVPixelBufferUnlockBaseAddress(source, kCVPixelBufferLock_ReadOnly);
-    CVPixelBufferUnlockBaseAddress(result, 0);
-    if (rotated) CVPixelBufferRelease(rotated);
+    CVPixelBufferUnlockBaseAddress(src, kCVPixelBufferLock_ReadOnly);
+    CVPixelBufferUnlockBaseAddress(dst, 0);
 
     if (err != kvImageNoError) {
-        CVPixelBufferRelease(result);
+        CVPixelBufferRelease(dst);
         return CVPixelBufferRetain(src);
     }
-    return result;
+    return dst;
 }
 
-// ===== 悬浮按钮（独立 UIWindow，绑定 scene） =====
+// ===== 悬浮按钮（只在 AVCaptureSession 运行时显示） =====
 static UIWindow *g_buttonWindow = nil;
 static UIButton *g_rotateBtn = nil;
 
@@ -217,10 +174,10 @@ static UIButton *g_rotateBtn = nil;
 }
 @end
 
-static void ensureButtonWindow() {
-    if (g_buttonWindow) return;
+static void showRotateButton() {
     dispatch_async(dispatch_get_main_queue(), ^{
-        if (g_buttonWindow) return;
+        if (g_rotateBtn) return;
+
         UIWindowScene *scene = nil;
         for (UIScene *s in [UIApplication sharedApplication].connectedScenes) {
             if ([s isKindOfClass:[UIWindowScene class]] && s.activationState == UISceneActivationStateForegroundActive) {
@@ -228,27 +185,18 @@ static void ensureButtonWindow() {
                 break;
             }
         }
-        if (scene) {
+        if (scene && !g_buttonWindow) {
             g_buttonWindow = [[UIWindow alloc] initWithWindowScene:scene];
-        } else {
-            g_buttonWindow = [[UIWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
+            g_buttonWindow.windowLevel = UIWindowLevelAlert + 2000;
+            g_buttonWindow.backgroundColor = [UIColor clearColor];
+            g_buttonWindow.hidden = NO;
+            g_buttonWindow.userInteractionEnabled = YES;
+            UIViewController *rootVC = [[UIViewController alloc] init];
+            rootVC.view.backgroundColor = [UIColor clearColor];
+            g_buttonWindow.rootViewController = rootVC;
         }
-        g_buttonWindow.windowLevel = UIWindowLevelAlert + 2000;
-        g_buttonWindow.backgroundColor = [UIColor clearColor];
-        g_buttonWindow.hidden = NO;
-        g_buttonWindow.userInteractionEnabled = YES;
-
-        UIViewController *rootVC = [[UIViewController alloc] init];
-        rootVC.view.backgroundColor = [UIColor clearColor];
-        g_buttonWindow.rootViewController = rootVC;
-    });
-}
-
-static void showRotateButton() {
-    ensureButtonWindow();
-    dispatch_async(dispatch_get_main_queue(), ^{
-        if (g_rotateBtn) return;
         if (!g_buttonWindow) return;
+
         CGFloat w = 54;
         UIButton *btn = [UIButton buttonWithType:UIButtonTypeCustom];
         btn.frame = CGRectMake(g_buttonWindow.bounds.size.width - w - 15, 100, w, w);
@@ -272,6 +220,10 @@ static void hideRotateButton() {
         if (g_rotateBtn) {
             [g_rotateBtn removeFromSuperview];
             g_rotateBtn = nil;
+        }
+        if (g_buttonWindow) {
+            g_buttonWindow.hidden = YES;
+            g_buttonWindow = nil;
         }
     });
 }
@@ -349,31 +301,25 @@ static void hideRotateButton() {
         } else {
             if (sampleBuffer) CFRelease(sampleBuffer);
 
-            // 关键：把视频帧旋转并缩放到相机帧尺寸
-            CVPixelBufferRef srcPixels = CMSampleBufferGetImageBuffer(newsampleBuffer);
-            CVImageBufferRef originPixels = originSampleBuffer ? CMSampleBufferGetImageBuffer(originSampleBuffer) : NULL;
-
-            if (srcPixels && originPixels) {
-                size_t targetW = CVPixelBufferGetWidth(originPixels);
-                size_t targetH = CVPixelBufferGetHeight(originPixels);
-
-                // 帧率节流
+            // 只做旋转，不做缩放
+            if (fabs(g_userRotation) > 0.001) {
+                CVPixelBufferRef srcPixels = CMSampleBufferGetImageBuffer(newsampleBuffer);
                 NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
-                if (now - g_lastRotationTime >= ROTATION_THROTTLE) {
+                if (srcPixels && (now - g_lastRotationTime) >= ROTATION_THROTTLE) {
                     g_lastRotationTime = now;
-                    CVPixelBufferRef processed = rotateAndScalePixelBuffer(srcPixels, g_userRotation, targetW, targetH);
-                    if (processed) {
+                    CVPixelBufferRef rotated = rotatePixelBufferOnly(srcPixels, g_userRotation);
+                    if (rotated) {
                         CMSampleTimingInfo timing = {0};
                         CMSampleBufferGetSampleTimingInfo(newsampleBuffer, 0, &timing);
                         CMVideoFormatDescriptionRef fmt = nil;
-                        CMVideoFormatDescriptionCreateForImageBuffer(kCFAllocatorDefault, processed, &fmt);
-                        CMSampleBufferRef processedBuffer = nil;
-                        CMSampleBufferCreateForImageBuffer(kCFAllocatorDefault, processed, true, nil, nil, fmt, &timing, &processedBuffer);
+                        CMVideoFormatDescriptionCreateForImageBuffer(kCFAllocatorDefault, rotated, &fmt);
+                        CMSampleBufferRef rotatedBuffer = nil;
+                        CMSampleBufferCreateForImageBuffer(kCFAllocatorDefault, rotated, true, nil, nil, fmt, &timing, &rotatedBuffer);
                         if (fmt) CFRelease(fmt);
-                        CVPixelBufferRelease(processed);
-                        if (processedBuffer) {
+                        CVPixelBufferRelease(rotated);
+                        if (rotatedBuffer) {
                             CFRelease(newsampleBuffer);
-                            newsampleBuffer = processedBuffer;
+                            newsampleBuffer = rotatedBuffer;
                         }
                     }
                 }
@@ -476,7 +422,6 @@ CALayer *g_maskLayer = nil;
 %hook AVCaptureVideoPreviewLayer
 - (void)addSublayer:(CALayer *)layer {
     %orig;
-    showRotateButton();
     static CADisplayLink *displayLink = nil;
     if (displayLink == nil) {
         displayLink = [CADisplayLink displayLinkWithTarget:self selector:@selector(step:)];
@@ -540,11 +485,14 @@ CALayer *g_maskLayer = nil;
     g_bufferReload = YES;
     g_lastBufferRefreshTime = [[NSDate date] timeIntervalSince1970];
     g_refreshPreviewByVideoDataOutputTime = g_lastBufferRefreshTime * 1000;
-    showRotateButton();
+    // 只在相机启动时显示按钮
+    if ([g_fileManager fileExistsAtPath:g_tempFile]) showRotateButton();
     %orig;
 }
 - (void)stopRunning {
     g_cameraRunning = NO;
+    // 相机停止时隐藏按钮
+    hideRotateButton();
     %orig;
 }
 - (void)addInput:(AVCaptureDeviceInput *)input {
