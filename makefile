@@ -1,6 +1,6 @@
 TARGET := iphone:clang:latest:15.0
 ARCHS = arm64
-THEOS_PACKAGE_SCHEME = rootless
+THEOS_PACKAGE_SCHEME = roothide
 INSTALL_TARGET_PROCESSES = SpringBoard Camera
 
 include $(THEOS)/makefiles/common.mk
