@@ -16,7 +16,6 @@ static BOOL g_cameraRunning = NO;
 static NSString *g_cameraPosition = @"B";
 static AVCaptureVideoOrientation g_photoOrientation = AVCaptureVideoOrientationPortrait;
 static BOOL g_isIOS15OrLater = NO;
-static BOOL g_systemCameraMode = NO;
 
 static AVAssetReader *reader = nil;
 static AVAssetReaderTrackOutput *videoTrackout_32BGRA = nil;
@@ -25,12 +24,14 @@ static AVAssetReaderTrackOutput *videoTrackout_420YpCbCr8BiPlanarFullRange = nil
 
 static NSTimeInterval g_lastBufferRefreshTime = 0;
 static const NSTimeInterval BUFFER_REFRESH_INTERVAL = 30.0;
+static dispatch_queue_t g_videoReadQueue = nil;
 
 NSString *g_tempFile = nil;
 NSString *g_isMirroredMark = nil;
 
 static NSDictionary *preferences;
 
+// ========== 偏好设置 ==========
 static void loadPreferences() {
     CFArrayRef keyList = CFPreferencesCopyKeyList(CFSTR("com.trizau.sileo.vcam"), kCFPreferencesCurrentUser, kCFPreferencesAnyHost);
     if (keyList) {
@@ -39,22 +40,34 @@ static void loadPreferences() {
     }
 }
 
-static BOOL getBoolFromPreferences(NSString *key, BOOL defaultValue) {
-    if (preferences && [preferences objectForKey:key]) {
-        return [[preferences objectForKey:key] boolValue];
-    }
-    return defaultValue;
-}
-
 static void updatePreferences() {
     loadPreferences();
-    g_systemCameraMode = getBoolFromPreferences(@"systemCameraMode", NO);
 }
 
 static void prefsChanged(CFNotificationCenterRef center, void *observer, CFStringRef name, const void *object, CFDictionaryRef userInfo) {
     updatePreferences();
 }
 
+// ========== 看门狗定时器 ==========
+static NSTimer *g_watchdogTimer = nil;
+
+static void VCAMStartWatchdog(void) {
+    if (g_watchdogTimer) return;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        g_watchdogTimer = [NSTimer scheduledTimerWithTimeInterval:2.0 repeats:YES block:^(NSTimer *timer) {
+            // 如果长时间没有更新预览，强制刷新 buffer
+            if (g_cameraRunning && g_previewLayer) {
+                NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
+                if (now - g_lastBufferRefreshTime > 5.0) {
+                    VCAM_LOG(@"看门狗触发：长时间无更新，强制刷新");
+                    g_bufferReload = YES;
+                }
+            }
+        }];
+    });
+}
+
+// ========== GetFrame 类 ==========
 @interface GetFrame : NSObject
 + (CMSampleBufferRef)getCurrentFrame:(CMSampleBufferRef)originSampleBuffer :(BOOL)forceReNew;
 + (UIWindow *)getKeyWindow;
@@ -107,9 +120,16 @@ static void prefsChanged(CFNotificationCenterRef center, void *observer, CFStrin
         }
     }
 
-    CMSampleBufferRef buf32 = [videoTrackout_32BGRA copyNextSampleBuffer];
-    CMSampleBufferRef bufVR = [videoTrackout_420YpCbCr8BiPlanarVideoRange copyNextSampleBuffer];
-    CMSampleBufferRef bufFR = [videoTrackout_420YpCbCr8BiPlanarFullRange copyNextSampleBuffer];
+    // 在后台线程安全地读取
+    __block CMSampleBufferRef buf32 = nil;
+    __block CMSampleBufferRef bufVR = nil;
+    __block CMSampleBufferRef bufFR = nil;
+
+    dispatch_sync(g_videoReadQueue, ^{
+        buf32 = [videoTrackout_32BGRA copyNextSampleBuffer];
+        bufVR = [videoTrackout_420YpCbCr8BiPlanarVideoRange copyNextSampleBuffer];
+        bufFR = [videoTrackout_420YpCbCr8BiPlanarFullRange copyNextSampleBuffer];
+    });
 
     CMSampleBufferRef newSample = nil;
     switch (subMediaType) {
@@ -178,6 +198,7 @@ static void prefsChanged(CFNotificationCenterRef center, void *observer, CFStrin
 
 @end
 
+// ========== DisplayLink 目标类 ==========
 @interface VCAMDisplayLinkTarget : NSObject
 @property (nonatomic, weak) AVCaptureVideoPreviewLayer *layer;
 @end
@@ -229,6 +250,7 @@ static void prefsChanged(CFNotificationCenterRef center, void *observer, CFStrin
 
 @end
 
+// ========== 安装替换层 ==========
 static VCAMDisplayLinkTarget *g_displayTarget = nil;
 static CADisplayLink *g_displayLink = nil;
 
@@ -257,6 +279,7 @@ static void VCAMSetupPreviewLayer(AVCaptureVideoPreviewLayer *layer) {
     }
 }
 
+// ========== Hook 1：预览层 ==========
 %hook AVCaptureVideoPreviewLayer
 
 - (void)addSublayer:(CALayer *)layer {
@@ -267,13 +290,12 @@ static void VCAMSetupPreviewLayer(AVCaptureVideoPreviewLayer *layer) {
 - (void)didMoveToSuperlayer {
     %orig;
     VCAM_LOG(@"didMoveToSuperlayer: superlayer=%@", NSStringFromClass([self.superlayer class]));
-    if (g_systemCameraMode) {
-        VCAMSetupPreviewLayer(self);
-    }
+    VCAMSetupPreviewLayer(self);
 }
 
 %end
 
+// ========== Hook 2：Session ==========
 %hook AVCaptureSession
 
 - (void)startRunning {
@@ -281,6 +303,7 @@ static void VCAMSetupPreviewLayer(AVCaptureVideoPreviewLayer *layer) {
     g_bufferReload = YES;
     g_lastBufferRefreshTime = [[NSDate date] timeIntervalSince1970];
     g_refreshPreviewByVideoDataOutputTime = g_lastBufferRefreshTime * 1000;
+    VCAMStartWatchdog();
     %orig;
 }
 
@@ -302,6 +325,7 @@ static void VCAMSetupPreviewLayer(AVCaptureVideoPreviewLayer *layer) {
 
 %end
 
+// ========== Hook 3：拍照（旧接口） ==========
 %hook AVCaptureStillImageOutput
 
 - (void)captureStillImageAsynchronouslyFromConnection:(AVCaptureConnection *)connection
@@ -332,6 +356,7 @@ static void VCAMSetupPreviewLayer(AVCaptureVideoPreviewLayer *layer) {
 
 %end
 
+// ========== Hook 4：拍照（iOS 15+ 接口） ==========
 %hook AVCapturePhotoOutput
 
 + (NSData *)JPEGPhotoDataRepresentationForJPEGSampleBuffer:(CMSampleBufferRef)JPEGSampleBuffer
@@ -424,6 +449,7 @@ static void VCAMSetupPreviewLayer(AVCaptureVideoPreviewLayer *layer) {
 
 %end
 
+// ========== Hook 5：视频数据流 ==========
 %hook AVCaptureVideoDataOutput
 
 - (void)setSampleBufferDelegate:(id<AVCaptureVideoDataOutputSampleBufferDelegate>)sampleBufferDelegate
@@ -454,6 +480,7 @@ static void VCAMSetupPreviewLayer(AVCaptureVideoPreviewLayer *layer) {
 
 %end
 
+// ========== 初始化 ==========
 %ctor {
     VCAM_LOG_STARTUP();
 
@@ -464,6 +491,7 @@ static void VCAMSetupPreviewLayer(AVCaptureVideoPreviewLayer *layer) {
         g_isIOS15OrLater = YES;
     }
     g_fileManager = [NSFileManager defaultManager];
+    g_videoReadQueue = dispatch_queue_create("com.vcam.videoRead", DISPATCH_QUEUE_SERIAL);
 
     updatePreferences();
 
@@ -483,4 +511,5 @@ static void VCAMSetupPreviewLayer(AVCaptureVideoPreviewLayer *layer) {
     g_bufferReload = YES;
     g_refreshPreviewByVideoDataOutputTime = 0;
     g_cameraRunning = NO;
+    g_watchdogTimer = nil;
 }
