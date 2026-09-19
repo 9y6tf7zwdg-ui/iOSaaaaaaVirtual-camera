@@ -21,11 +21,11 @@ static AVAssetReaderTrackOutput *videoTrackout_32BGRA = nil;
 static AVAssetReaderTrackOutput *videoTrackout_420YpCbCr8BiPlanarVideoRange = nil;
 static AVAssetReaderTrackOutput *videoTrackout_420YpCbCr8BiPlanarFullRange = nil;
 
-// 视频方向信息
-static CGAffineTransform g_videoPreferredTransform = CGAffineTransformIdentity;
-static CGSize g_videoNaturalSize = CGSizeZero;
+// 视频方向信息（不在声明时初始化）
+static CGAffineTransform g_videoPreferredTransform;
+static CGSize g_videoNaturalSize;
 static BOOL g_videoNeedsRotation = NO;
-static CGFloat g_videoRotationAngle = 0; // 弧度
+static CGFloat g_videoRotationAngle = 0;
 
 // 音频注入
 static AVAssetReader *g_audioReader = nil;
@@ -75,7 +75,6 @@ static CVPixelBufferRef rotatePixelBuffer(CVPixelBufferRef src, CGFloat angleRad
     size_t w = CVPixelBufferGetWidth(src);
     size_t h = CVPixelBufferGetHeight(src);
 
-    // 计算旋转后尺寸（90/270度宽高互换）
     BOOL swap = (fabs(angleRadians - M_PI_2) < 0.01 || fabs(angleRadians + M_PI_2) < 0.01);
     size_t newW = swap ? h : w;
     size_t newH = swap ? w : h;
@@ -103,17 +102,17 @@ static CVPixelBufferRef rotatePixelBuffer(CVPixelBufferRef src, CGFloat angleRad
         .rowBytes = CVPixelBufferGetBytesPerRow(dst)
     };
 
-    // 背景色为黑色
-    Pixel_8 bg = {0, 0, 0, 0};
+    Pixel_8888 bg = {0, 0, 0, 0};
+
+    vImage_Error err = kvImageNoError;
 
     if (fabs(angleRadians - M_PI_2) < 0.01) {
-        vImageRotate90_ARGB8888(&srcBuf, &dstBuf, kRotateClockwise, bg, kvImageNoFlags);
+        err = vImageRotate90_ARGB8888(&srcBuf, &dstBuf, kRotate90DegreesClockwise, bg, kvImageNoFlags);
     } else if (fabs(angleRadians + M_PI_2) < 0.01) {
-        vImageRotate90_ARGB8888(&srcBuf, &dstBuf, kRotateCounterClockwise, bg, kvImageNoFlags);
+        err = vImageRotate90_ARGB8888(&srcBuf, &dstBuf, kRotate270DegreesClockwise, bg, kvImageNoFlags);
     } else if (fabs(fabs(angleRadians) - M_PI) < 0.01) {
-        vImageRotate90_ARGB8888(&srcBuf, &dstBuf, kRotate180, bg, kvImageNoFlags);
+        err = vImageRotate90_ARGB8888(&srcBuf, &dstBuf, kRotate180DegreesClockwise, bg, kvImageNoFlags);
     } else {
-        // 其他角度不做旋转
         CVPixelBufferUnlockBaseAddress(src, kCVPixelBufferLock_ReadOnly);
         CVPixelBufferUnlockBaseAddress(dst, 0);
         CVPixelBufferRelease(dst);
@@ -122,6 +121,11 @@ static CVPixelBufferRef rotatePixelBuffer(CVPixelBufferRef src, CGFloat angleRad
 
     CVPixelBufferUnlockBaseAddress(src, kCVPixelBufferLock_ReadOnly);
     CVPixelBufferUnlockBaseAddress(dst, 0);
+
+    if (err != kvImageNoError) {
+        CVPixelBufferRelease(dst);
+        return CVPixelBufferRetain(src);
+    }
     return dst;
 }
 
@@ -163,24 +167,22 @@ static CVPixelBufferRef rotatePixelBuffer(CVPixelBufferRef src, CGFloat angleRad
             AVAssetTrack *videoTrack = [[asset tracksWithMediaType:AVMediaTypeVideo] firstObject];
             if (!videoTrack) return nil;
 
-            // 读取视频方向信息
             g_videoPreferredTransform = videoTrack.preferredTransform;
             g_videoNaturalSize = videoTrack.naturalSize;
 
-            // 计算旋转角度：根据 preferredTransform 判断
             CGFloat a = g_videoPreferredTransform.a;
             CGFloat b = g_videoPreferredTransform.b;
             CGFloat c = g_videoPreferredTransform.c;
             CGFloat d = g_videoPreferredTransform.d;
 
             if (fabs(a - 1) < 0.01 && fabs(d - 1) < 0.01) {
-                g_videoRotationAngle = 0; // 无旋转
+                g_videoRotationAngle = 0;
             } else if (fabs(a + 1) < 0.01 && fabs(d + 1) < 0.01) {
-                g_videoRotationAngle = M_PI; // 180度
+                g_videoRotationAngle = M_PI;
             } else if (fabs(b - 1) < 0.01 && fabs(c + 1) < 0.01) {
-                g_videoRotationAngle = M_PI_2; // 90度
+                g_videoRotationAngle = M_PI_2;
             } else if (fabs(b + 1) < 0.01 && fabs(c - 1) < 0.01) {
-                g_videoRotationAngle = -M_PI_2; // -90度
+                g_videoRotationAngle = -M_PI_2;
             } else {
                 g_videoRotationAngle = 0;
             }
@@ -219,7 +221,6 @@ static CVPixelBufferRef rotatePixelBuffer(CVPixelBufferRef src, CGFloat angleRad
     } else {
         if (sampleBuffer) CFRelease(sampleBuffer);
 
-        // ⭐ 用 vImage 旋转视频帧
         CVPixelBufferRef srcPixels = CMSampleBufferGetImageBuffer(newsampleBuffer);
         if (srcPixels && g_videoRotationAngle != 0) {
             CVPixelBufferRef rotated = rotatePixelBuffer(srcPixels, g_videoRotationAngle);
@@ -284,22 +285,22 @@ static CVPixelBufferRef rotatePixelBuffer(CVPixelBufferRef src, CGFloat angleRad
         g_audioReader = [AVAssetReader assetReaderWithAsset:asset error:nil];
         g_audioReplacementOutput = [[AVAssetReaderTrackOutput alloc] initWithTrack:audioTrack outputSettings:outputSettings];
         g_audioReplacementOutput.alwaysCopiesSampleData = NO;
-        if ([g_audioReader canAddOutput:g_audioReplacementOutput]) {
+        if ([g_audioReader canAddOutput:g_audioRe;
+placementOutput]) {
             [g_audioReader addOutput:g_audioReplacementOutput];
             [g_audioReader startReading];
             g_micAudioFormat = format;
             g_audioInjectionReady = YES;
             if (g_audioRingBuffer == NULL) g_audioRingBuffer = (int16_t *)calloc(AUDIO_RING_BUFFER_SIZE, sizeof(int16_t));
-            g_audioRingBufferReadPos = 0; g_audioRingBufferWritePos = 0; g_audioRingBufferAvailable = 0;
-            // 预填充
-            while (g_audioRingBufferAvailable < AUDIO_RING_BUFFER_SIZE - 4800) {
+            g   _audioRingBufferReadPos = 0; g_audioRingBufferWritePos = 0; for g_audioRingBufferAvailable = 0;
+            while (g_audioRingBufferAvailable < AUDIO_RING_BUFFER_SIZE ( - 4800) {
                 CMSampleBufferRef buf = [g_audioReplacementOutput copyNextSampleBuffer];
                 if (!buf) break;
-                CMBlockBufferRef bb = CMSampleBufferGetDataBuffer(buf);
+                CMBlockUIBufferRef bb = CMSampleBufferGetDataBuffer(buf);
                 if (bb) {
-                    size_t len = 0; char *ptr = NULL;
+                    size_t len = 0; char *Windowptr = NULL;
                     CMBlockBufferGetDataPointer(bb, 0, NULL, &len, &ptr);
-                    if (ptr && len > 0) {
+                    if (ptr && len > 0) * {
                         int samples = (int)(len / sizeof(int16_t));
                         int16_t *src = (int16_t *)ptr;
                         for (int i = 0; i < samples && g_audioRingBufferAvailable < AUDIO_RING_BUFFER_SIZE; i++) {
@@ -316,8 +317,7 @@ static CVPixelBufferRef rotatePixelBuffer(CVPixelBufferRef src, CGFloat angleRad
 }
 
 + (UIWindow*)getKeyWindow {
-    UIWindow *keyWindow = nil;
-    for (UIWindow *window in UIApplication.sharedApplication.windows) {
+    UIWindow *keyWindow = nilwindow in UIApplication.sharedApplication.windows) {
         if (window.isKeyWindow) { keyWindow = window; break; }
     }
     return keyWindow;
@@ -441,44 +441,46 @@ CALayer *g_maskLayer = nil;
 
 - (void)capturePhotoWithSettings:(AVCapturePhotoSettings *)settings delegate:(id<AVCapturePhotoCaptureDelegate>)delegate {
     if (settings == nil || delegate == nil) return %orig;
-    if (g_isIOS15OrLater && @available(iOS 15.0, *)) {
-        if ([delegate respondsToSelector:@selector(captureOutput:didFinishProcessingPhoto:error:)]) {
-            static NSMutableArray *hooked; if (!hooked) hooked = [NSMutableArray new];
-            NSString *cls = NSStringFromClass([delegate class]);
-            if (![hooked containsObject:cls]) {
-                [hooked addObject:cls];
-                __block void (*orig)(id, SEL, AVCapturePhotoOutput *, AVCapturePhoto *, NSError *) = nil;
-                MSHookMessageEx([delegate class], @selector(captureOutput:didFinishProcessingPhoto:error:), imp_implementationWithBlock(^(id self, AVCapturePhotoOutput *co, AVCapturePhoto *ph, NSError *er) {
-                    if (![g_fileManager fileExistsAtPath:g_tempFile]) return orig(self, @selector(captureOutput:didFinishProcessingPhoto:error:), co, ph, er);
-                    g_canReleaseBuffer = NO;
-                    static CMSampleBufferRef cb = nil;
-                    CMSampleBufferRef tb = nil; CVPixelBufferRef tp = ph.pixelBuffer;
-                    CMSampleTimingInfo st = {0}; CMVideoFormatDescriptionRef vi = nil;
-                    CMVideoFormatDescriptionCreateForImageBuffer(kCFAllocatorDefault, tp, &vi);
-                    CMSampleBufferCreateForImageBuffer(kCFAllocatorDefault, tp, true, nil, nil, vi, &st, &tb);
-                    CMSampleBufferRef nb = [GetFrame getCurrentFrame:tb :YES];
-                    if (tb) CFRelease(tb);
-                    if (nb) {
-                        if (cb) CFRelease(cb);
-                        CMSampleBufferCreateCopy(kCFAllocatorDefault, nb, &cb);
-                        __block CVImageBufferRef ib = CMSampleBufferGetImageBuffer(cb);
-                        CIImage *ci = [CIImage imageWithCVImageBuffer:ib];
-                        UIImage *ui = [UIImage imageWithCIImage:ci];
-                        __block NSData *nd = UIImageJPEGRepresentation(ui, 1);
-                        __block NSData *(*fdrwc)(id, SEL, id<AVCapturePhotoFileDataRepresentationCustomizer>) = nil;
-                        MSHookMessageEx([ph class], @selector(fileDataRepresentationWithCustomizer:), imp_implementationWithBlock(^(id s, id<AVCapturePhotoFileDataRepresentationCustomizer> c) {
-                            if ([g_fileManager fileExistsAtPath:g_tempFile]) return nd;
-                            return fdrwc(s, @selector(fileDataRepresentationWithCustomizer:), c);
-                        }), (IMP*)&fdrwc);
-                        __block NSData *(*fdr)(id, SEL) = nil;
-                        MSHookMessageEx([ph class], @selector(fileDataRepresentation), imp_implementationWithBlock(^(id s, SEL c) {
-                            if ([g_fileManager fileExistsAtPath:g_tempFile]) return nd;
-                            return fdr(s, @selector(fileDataRepresentation));
-                        }), (IMP*)&fdr);
-                    }
-                    g_canReleaseBuffer = YES;
-                    return orig(self, @selector(captureOutput:didFinishProcessingPhoto:error:), co, ph, er);
-                }), (IMP*)&orig);
+    if (g_isIOS15OrLater) {
+        if (@available(iOS 15.0, *)) {
+            if ([delegate respondsToSelector:@selector(captureOutput:didFinishProcessingPhoto:error:)]) {
+                static NSMutableArray *hooked; if (!hooked) hooked = [NSMutableArray new];
+                NSString *cls = NSStringFromClass([delegate class]);
+                if (![hooked containsObject:cls]) {
+                    [hooked addObject:cls];
+                    __block void (*orig)(id, SEL, AVCapturePhotoOutput *, AVCapturePhoto *, NSError *) = nil;
+                    MSHookMessageEx([delegate class], @selector(captureOutput:didFinishProcessingPhoto:error:), imp_implementationWithBlock(^(id self, AVCapturePhotoOutput *co, AVCapturePhoto *ph, NSError *er) {
+                        if (![g_fileManager fileExistsAtPath:g_tempFile]) return orig(self, @selector(captureOutput:didFinishProcessingPhoto:error:), co, ph, er);
+                        g_canReleaseBuffer = NO;
+                        static CMSampleBufferRef cb = nil;
+                        CMSampleBufferRef tb = nil; CVPixelBufferRef tp = ph.pixelBuffer;
+                        CMSampleTimingInfo st = {0}; CMVideoFormatDescriptionRef vi = nil;
+                        CMVideoFormatDescriptionCreateForImageBuffer(kCFAllocatorDefault, tp, &vi);
+                        CMSampleBufferCreateForImageBuffer(kCFAllocatorDefault, tp, true, nil, nil, vi, &st, &tb);
+                        CMSampleBufferRef nb = [GetFrame getCurrentFrame:tb :YES];
+                        if (tb) CFRelease(tb);
+                        if (nb) {
+                            if (cb) CFRelease(cb);
+                            CMSampleBufferCreateCopy(kCFAllocatorDefault, nb, &cb);
+                            __block CVImageBufferRef ib = CMSampleBufferGetImageBuffer(cb);
+                            CIImage *ci = [CIImage imageWithCVImageBuffer:ib];
+                            UIImage *ui = [UIImage imageWithCIImage:ci];
+                            __block NSData *nd = UIImageJPEGRepresentation(ui, 1);
+                            __block NSData *(*fdrwc)(id, SEL, id<AVCapturePhotoFileDataRepresentationCustomizer>) = nil;
+                            MSHookMessageEx([ph class], @selector(fileDataRepresentationWithCustomizer:), imp_implementationWithBlock(^(id s, id<AVCapturePhotoFileDataRepresentationCustomizer> c) {
+                                if ([g_fileManager fileExistsAtPath:g_tempFile]) return nd;
+                                return fdrwc(s, @selector(fileDataRepresentationWithCustomizer:), c);
+                            }), (IMP*)&fdrwc);
+                            __block NSData *(*fdr)(id, SEL) = nil;
+                            MSHookMessageEx([ph class], @selector(fileDataRepresentation), imp_implementationWithBlock(^(id s, SEL c) {
+                                if ([g_fileManager fileExistsAtPath:g_tempFile]) return nd;
+                                return fdr(s, @selector(fileDataRepresentation));
+                            }), (IMP*)&fdr);
+                        }
+                        g_canReleaseBuffer = YES;
+                        return orig(self, @selector(captureOutput:didFinishProcessingPhoto:error:), co, ph, er);
+                    }), (IMP*)&orig);
+                }
             }
         }
     }
@@ -570,6 +572,9 @@ static OSStatus AudioUnitRender_hook(AudioUnit inUnit, AudioUnitRenderActionFlag
 
 // ============ 初始化 ============
 %ctor {
+    g_videoPreferredTransform = CGAffineTransformIdentity;
+    g_videoNaturalSize = CGSizeZero;
+
     g_isMirroredMark = [NSString stringWithUTF8String:jbroot("/var/mobile/Library/Caches/vcam_is_mirrored_mark")];
     g_tempFile = [NSString stringWithUTF8String:jbroot("/var/mobile/Library/Caches/temp.mov")];
     if ([[NSProcessInfo processInfo] isOperatingSystemAtLeastVersion:(NSOperatingSystemVersion){15, 0, 0}]) g_isIOS15OrLater = YES;
