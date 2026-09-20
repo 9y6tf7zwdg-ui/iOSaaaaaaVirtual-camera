@@ -1,10 +1,18 @@
 #import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
 #import <AVFoundation/AVFoundation.h>
-#import <AudioToolbox/AudioToolbox.h>
 #include <roothide.h>
 #import <substrate.h>
+#import "VCAMAudioRoute.h"
 
+#define VCAM_LOG 1
+#if VCAM_LOG
+#define VCLOG(fmt, ...) NSLog(@"[VCAM] " fmt, ##__VA_ARGS__)
+#else
+#define VCLOG(fmt, ...) do {} while(0)
+#endif
+
+// ============ 视频替换 ============
 static NSFileManager *g_fileManager = nil;
 static BOOL g_canReleaseBuffer = YES;
 static BOOL g_bufferReload = YES;
@@ -18,19 +26,6 @@ static AVAssetReader *reader = nil;
 static AVAssetReaderTrackOutput *videoTrackout_32BGRA = nil;
 static AVAssetReaderTrackOutput *videoTrackout_420YpCbCr8BiPlanarVideoRange = nil;
 static AVAssetReaderTrackOutput *videoTrackout_420YpCbCr8BiPlanarFullRange = nil;
-
-// 音频注入
-static AVAssetReader *g_audioReader = nil;
-static AVAssetReaderTrackOutput *g_audioReplacementOutput = nil;
-static AudioStreamBasicDescription g_micAudioFormat = {0};
-static BOOL g_audioInjectionReady = NO;
-static BOOL g_audioEnabled = YES;
-
-#define AUDIO_RING_BUFFER_SIZE (48000 * 4)
-static int16_t *g_audioRingBuffer = NULL;
-static volatile int g_audioRingBufferReadPos = 0;
-static volatile int g_audioRingBufferWritePos = 0;
-static volatile int g_audioRingBufferAvailable = 0;
 
 static NSTimeInterval g_lastBufferRefreshTime = 0;
 static const NSTimeInterval BUFFER_REFRESH_INTERVAL = 30.0;
@@ -58,92 +53,16 @@ static BOOL getBoolFromPreferences(NSString *key, BOOL defaultValue) {
 
 static void updatePreferences() {
     loadPreferences();
-    g_audioEnabled = getBoolFromPreferences(@"enableAudio", YES);
+    BOOL enabled = getBoolFromPreferences(@"enableAudio", YES);
+    [VCAMAudioRoute setEnabled:enabled];
+    VCLOG(@"preferences: audioEnabled=%d", enabled);
 }
 
 static void prefsChanged(CFNotificationCenterRef center, void *observer, CFStringRef name, const void *object, CFDictionaryRef userInfo) {
     updatePreferences();
 }
 
-// ===== 音频注入辅助函数 =====
-static void ensureRingBufferAllocated() {
-    if (g_audioRingBuffer == NULL) {
-        g_audioRingBuffer = (int16_t *)calloc(AUDIO_RING_BUFFER_SIZE, sizeof(int16_t));
-    }
-}
-
-static void fillRingBufferFromVideo() {
-    if (!g_audioReplacementOutput || !g_audioReader) return;
-    ensureRingBufferAllocated();
-
-    while (g_audioRingBufferAvailable < AUDIO_RING_BUFFER_SIZE - 4800) {
-        CMSampleBufferRef audioBuffer = [g_audioReplacementOutput copyNextSampleBuffer];
-        if (!audioBuffer) {
-            [g_audioReader cancelReading];
-            g_audioReader = nil;
-            g_audioReplacementOutput = nil;
-            g_audioInjectionReady = NO;
-            return;
-        }
-
-        CMBlockBufferRef blockBuffer = CMSampleBufferGetDataBuffer(audioBuffer);
-        if (blockBuffer) {
-            size_t totalLength = 0;
-            char *dataPointer = NULL;
-            CMBlockBufferGetDataPointer(blockBuffer, 0, NULL, &totalLength, &dataPointer);
-            if (dataPointer && totalLength > 0) {
-                int samples = (int)(totalLength / sizeof(int16_t));
-                int16_t *srcData = (int16_t *)dataPointer;
-                for (int i = 0; i < samples && g_audioRingBufferAvailable < AUDIO_RING_BUFFER_SIZE; i++) {
-                    g_audioRingBuffer[g_audioRingBufferWritePos] = srcData[i];
-                    g_audioRingBufferWritePos = (g_audioRingBufferWritePos + 1) % AUDIO_RING_BUFFER_SIZE;
-                    g_audioRingBufferAvailable++;
-                }
-            }
-        }
-        CFRelease(audioBuffer);
-    }
-}
-
-static void setupAudioInjectionWithFormat(AudioStreamBasicDescription format) {
-    if (g_audioInjectionReady || !g_audioEnabled) return;
-    if (![g_fileManager fileExistsAtPath:g_tempFile]) return;
-
-    @try {
-        AVAsset *asset = [AVAsset assetWithURL:[NSURL URLWithString:[NSString stringWithFormat:@"file://%@", g_tempFile]]];
-        AVAssetTrack *audioTrack = [[asset tracksWithMediaType:AVMediaTypeAudio] firstObject];
-        if (!audioTrack) return;
-
-        NSDictionary *outputSettings = @{
-            AVFormatIDKey: @(kAudioFormatLinearPCM),
-            AVSampleRateKey: @(format.mSampleRate),
-            AVNumberOfChannelsKey: @(format.mChannelsPerFrame),
-            AVLinearPCMBitDepthKey: @(16),
-            AVLinearPCMIsFloatKey: @(NO),
-            AVLinearPCMIsNonInterleaved: @(NO),
-        };
-
-        g_audioReader = [AVAssetReader assetReaderWithAsset:asset error:nil];
-        g_audioReplacementOutput = [[AVAssetReaderTrackOutput alloc] initWithTrack:audioTrack outputSettings:outputSettings];
-        g_audioReplacementOutput.alwaysCopiesSampleData = NO;
-
-        if ([g_audioReader canAddOutput:g_audioReplacementOutput]) {
-            [g_audioReader addOutput:g_audioReplacementOutput];
-            [g_audioReader startReading];
-            g_micAudioFormat = format;
-            g_audioInjectionReady = YES;
-            ensureRingBufferAllocated();
-            g_audioRingBufferReadPos = 0;
-            g_audioRingBufferWritePos = 0;
-            g_audioRingBufferAvailable = 0;
-            fillRingBufferFromVideo();
-        }
-    } @catch (NSException *e) {
-        NSLog(@"[VCAM] 音频注入初始化失败: %@", e);
-    }
-}
-
-// ===== GetFrame =====
+// ============ GetFrame ============
 @interface GetFrame : NSObject
 + (CMSampleBufferRef _Nullable)getCurrentFrame:(CMSampleBufferRef)originSampleBuffer :(BOOL)forceReNew;
 + (UIWindow*)getKeyWindow;
@@ -188,13 +107,12 @@ static void setupAudioInjectionWithFormat(AudioStreamBasicDescription format) {
                 videoTrackout_32BGRA = [[AVAssetReaderTrackOutput alloc] initWithTrack:videoTrack outputSettings:@{(id)kCVPixelBufferPixelFormatTypeKey:@(kCVPixelFormatType_32BGRA)}];
                 videoTrackout_420YpCbCr8BiPlanarVideoRange = [[AVAssetReaderTrackOutput alloc] initWithTrack:videoTrack outputSettings:@{(id)kCVPixelBufferPixelFormatTypeKey:@(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange)}];
                 videoTrackout_420YpCbCr8BiPlanarFullRange = [[AVAssetReaderTrackOutput alloc] initWithTrack:videoTrack outputSettings:@{(id)kCVPixelBufferPixelFormatTypeKey:@(kCVPixelFormatType_420YpCbCr8BiPlanarFullRange)}];
-
                 [reader addOutput:videoTrackout_32BGRA];
                 [reader addOutput:videoTrackout_420YpCbCr8BiPlanarVideoRange];
                 [reader addOutput:videoTrackout_420YpCbCr8BiPlanarFullRange];
                 [reader startReading];
             } @catch (NSException *except) {
-                NSLog(@"[VCAM] 初始化读取视频出错:%@", except);
+                VCLOG(@"初始化读取视频出错: %@", except);
             }
         }
 
@@ -252,7 +170,7 @@ static void setupAudioInjectionWithFormat(AudioStreamBasicDescription format) {
         if (sampleBuffer && CMSampleBufferIsValid(sampleBuffer)) return sampleBuffer;
         return nil;
     } @catch (NSException *e) {
-        NSLog(@"[VCAM] getCurrentFrame 异常: %@", e);
+        VCLOG(@"getCurrentFrame 异常: %@", e);
         return nil;
     }
 }
@@ -269,7 +187,7 @@ static void setupAudioInjectionWithFormat(AudioStreamBasicDescription format) {
 }
 @end
 
-// ===== 视频 Hook =====
+// ============ 视频 Hook ============
 CALayer *g_maskLayer = nil;
 
 %hook AVCaptureVideoPreviewLayer
@@ -334,6 +252,7 @@ CALayer *g_maskLayer = nil;
 
 %hook AVCaptureSession
 - (void)startRunning {
+    VCLOG(@"===== 相机启动 =====");
     g_cameraRunning = YES;
     g_bufferReload = YES;
     g_lastBufferRefreshTime = [[NSDate date] timeIntervalSince1970];
@@ -341,6 +260,7 @@ CALayer *g_maskLayer = nil;
     %orig;
 }
 - (void)stopRunning {
+    VCLOG(@"===== 相机停止 =====");
     g_cameraRunning = NO;
     %orig;
 }
@@ -439,7 +359,7 @@ CALayer *g_maskLayer = nil;
                             }
                             g_canReleaseBuffer = YES;
                         } @catch (NSException *e) {
-                            NSLog(@"[VCAM] photo hook 异常: %@", e);
+                            VCLOG(@"photo hook 异常: %@", e);
                         }
                         return original_method(self, @selector(captureOutput:didFinishProcessingPhoto:error:), captureOutput, photo, error);
                     }), (IMP*)&original_method);
@@ -471,7 +391,7 @@ CALayer *g_maskLayer = nil;
                 }
                 return original_method(self, @selector(captureOutput:didOutputSampleBuffer:fromConnection:), output, newBuffer ?: sampleBuffer, connection);
             } @catch (NSException *e) {
-                NSLog(@"[VCAM] videoDataOutput hook 异常: %@", e);
+                VCLOG(@"videoDataOutput hook 异常: %@", e);
                 return original_method(self, @selector(captureOutput:didOutputSampleBuffer:fromConnection:), output, sampleBuffer, connection);
             }
         }), (IMP*)&original_method);
@@ -480,64 +400,19 @@ CALayer *g_maskLayer = nil;
 }
 %end
 
-// ===== 音频 Hook =====
-static OSStatus (*AudioUnitRender_orig)(AudioUnit, AudioUnitRenderActionFlags *, const AudioTimeStamp *, UInt32, UInt32, AudioBufferList *) = NULL;
-
-static OSStatus AudioUnitRender_hook(AudioUnit inUnit, AudioUnitRenderActionFlags *ioActionFlags, const AudioTimeStamp *inTimeStamp, UInt32 inOutputBusNumber, UInt32 inNumberFrames, AudioBufferList *ioData) {
-    OSStatus status = AudioUnitRender_orig(inUnit, ioActionFlags, inTimeStamp, inOutputBusNumber, inNumberFrames, ioData);
-    @try {
-        if (status != noErr || inOutputBusNumber != 1 || !g_audioEnabled) return status;
-
-        if (!g_audioInjectionReady) {
-            if (ioData && ioData->mNumberBuffers > 0) {
-                AudioBuffer *buf = &ioData->mBuffers[0];
-                g_micAudioFormat.mSampleRate = 44100.0;
-                g_micAudioFormat.mChannelsPerFrame = buf->mNumberChannels;
-                g_micAudioFormat.mBitsPerChannel = 16;
-                g_micAudioFormat.mFormatID = kAudioFormatLinearPCM;
-                g_micAudioFormat.mFormatFlags = kAudioFormatFlagIsSignedInteger | kAudioFormatFlagIsPacked;
-                g_micAudioFormat.mBytesPerFrame = g_micAudioFormat.mChannelsPerFrame * sizeof(int16_t);
-                g_micAudioFormat.mFramesPerPacket = 1;
-                g_micAudioFormat.mBytesPerPacket = g_micAudioFormat.mBytesPerFrame;
-                setupAudioInjectionWithFormat(g_micAudioFormat);
-            }
-            if (!g_audioInjectionReady) return status;
-        }
-
-        if (ioData && ioData->mNumberBuffers > 0) {
-            AudioBuffer *buf = &ioData->mBuffers[0];
-            int16_t *out = (int16_t *)buf->mData;
-            int need = inNumberFrames * buf->mNumberChannels;
-            for (int i = 0; i < need; i++) {
-                if (g_audioRingBufferAvailable > 0) {
-                    out[i] = g_audioRingBuffer[g_audioRingBufferReadPos];
-                    g_audioRingBufferReadPos = (g_audioRingBufferReadPos + 1) % AUDIO_RING_BUFFER_SIZE;
-                    g_audioRingBufferAvailable--;
-                } else {
-                    out[i] = 0;
-                }
-            }
-            if (g_audioRingBufferAvailable < 4800) {
-                dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-                    fillRingBufferFromVideo();
-                });
-            }
-        }
-    } @catch (NSException *e) {
-        NSLog(@"[VCAM] 音频 hook 异常: %@", e);
-    }
-    return status;
-}
-
-// ===== 初始化 =====
+// ============ 初始化 ============
 %ctor {
+    VCLOG(@"======== VCAM 加载 ========");
+
     g_isMirroredMark = [NSString stringWithUTF8String:jbroot("/var/mobile/Library/Caches/vcam_is_mirrored_mark")];
     g_tempFile = [NSString stringWithUTF8String:jbroot("/var/mobile/Library/Caches/temp.mov")];
+    VCLOG(@"tempFile: %@", g_tempFile);
 
     if ([[NSProcessInfo processInfo] isOperatingSystemAtLeastVersion:(NSOperatingSystemVersion){15, 0, 0}]) g_isIOS15OrLater = YES;
     g_fileManager = [NSFileManager defaultManager];
 
     updatePreferences();
+    [VCAMAudioRoute install];
 
     CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(),
                                     NULL,
@@ -545,22 +420,15 @@ static OSStatus AudioUnitRender_hook(AudioUnit inUnit, AudioUnitRenderActionFlag
                                     CFSTR("com.trizau.sileo.vcam.prefschanged"),
                                     NULL,
                                     CFNotificationSuspensionBehaviorDeliverImmediately);
-
-    MSHookFunction((void *)AudioUnitRender, (void *)AudioUnitRender_hook, (void **)&AudioUnitRender_orig);
 }
 
 %dtor {
+    VCLOG(@"======== VCAM 卸载 ========");
     g_fileManager = nil;
     g_canReleaseBuffer = YES;
     g_bufferReload = YES;
     g_previewLayer = nil;
     g_refreshPreviewByVideoDataOutputTime = 0;
     g_cameraRunning = NO;
-    if (g_audioRingBuffer) {
-        free(g_audioRingBuffer);
-        g_audioRingBuffer = NULL;
-    }
-    g_audioReader = nil;
-    g_audioReplacementOutput = nil;
-    g_audioInjectionReady = NO;
+    [VCAMAudioRoute uninstall];
 }
