@@ -48,35 +48,48 @@ static void loadPreferences() {
         CFRelease(keyList);
     }
 }
+
 static BOOL getBoolFromPreferences(NSString *key, BOOL defaultValue) {
-    if (preferences && [preferences objectForKey:key]) return [[preferences objectForKey:key] boolValue];
+    if (preferences && [preferences objectForKey:key]) {
+        return [[preferences objectForKey:key] boolValue];
+    }
     return defaultValue;
 }
+
 static void updatePreferences() {
     loadPreferences();
     g_audioEnabled = getBoolFromPreferences(@"enableAudio", YES);
 }
+
 static void prefsChanged(CFNotificationCenterRef center, void *observer, CFStringRef name, const void *object, CFDictionaryRef userInfo) {
     updatePreferences();
 }
 
-// 音频注入
+// ===== 音频注入辅助函数 =====
 static void ensureRingBufferAllocated() {
     if (g_audioRingBuffer == NULL) {
         g_audioRingBuffer = (int16_t *)calloc(AUDIO_RING_BUFFER_SIZE, sizeof(int16_t));
     }
 }
+
 static void fillRingBufferFromVideo() {
     if (!g_audioReplacementOutput || !g_audioReader) return;
     ensureRingBufferAllocated();
+
     while (g_audioRingBufferAvailable < AUDIO_RING_BUFFER_SIZE - 4800) {
         CMSampleBufferRef audioBuffer = [g_audioReplacementOutput copyNextSampleBuffer];
         if (!audioBuffer) {
-            [g_audioReader cancelReading]; g_audioReader = nil; g_audioReplacementOutput = nil; g_audioInjectionReady = NO; return;
+            [g_audioReader cancelReading];
+            g_audioReader = nil;
+            g_audioReplacementOutput = nil;
+            g_audioInjectionReady = NO;
+            return;
         }
+
         CMBlockBufferRef blockBuffer = CMSampleBufferGetDataBuffer(audioBuffer);
         if (blockBuffer) {
-            size_t totalLength = 0; char *dataPointer = NULL;
+            size_t totalLength = 0;
+            char *dataPointer = NULL;
             CMBlockBufferGetDataPointer(blockBuffer, 0, NULL, &totalLength, &dataPointer);
             if (dataPointer && totalLength > 0) {
                 int samples = (int)(totalLength / sizeof(int16_t));
@@ -91,57 +104,79 @@ static void fillRingBufferFromVideo() {
         CFRelease(audioBuffer);
     }
 }
+
 static void setupAudioInjectionWithFormat(AudioStreamBasicDescription format) {
     if (g_audioInjectionReady || !g_audioEnabled) return;
     if (![g_fileManager fileExistsAtPath:g_tempFile]) return;
+
     @try {
         AVAsset *asset = [AVAsset assetWithURL:[NSURL URLWithString:[NSString stringWithFormat:@"file://%@", g_tempFile]]];
         AVAssetTrack *audioTrack = [[asset tracksWithMediaType:AVMediaTypeAudio] firstObject];
         if (!audioTrack) return;
+
         NSDictionary *outputSettings = @{
-            AVFormatIDKey: @(kAudioFormatLinearPCM), AVSampleRateKey: @(format.mSampleRate),
-            AVNumberOfChannelsKey: @(format.mChannelsPerFrame), AVLinearPCMBitDepthKey: @(16),
-            AVLinearPCMIsFloatKey: @(NO), AVLinearPCMIsNonInterleaved: @(NO),
+            AVFormatIDKey: @(kAudioFormatLinearPCM),
+            AVSampleRateKey: @(format.mSampleRate),
+            AVNumberOfChannelsKey: @(format.mChannelsPerFrame),
+            AVLinearPCMBitDepthKey: @(16),
+            AVLinearPCMIsFloatKey: @(NO),
+            AVLinearPCMIsNonInterleaved: @(NO),
         };
+
         g_audioReader = [AVAssetReader assetReaderWithAsset:asset error:nil];
         g_audioReplacementOutput = [[AVAssetReaderTrackOutput alloc] initWithTrack:audioTrack outputSettings:outputSettings];
         g_audioReplacementOutput.alwaysCopiesSampleData = NO;
+
         if ([g_audioReader canAddOutput:g_audioReplacementOutput]) {
             [g_audioReader addOutput:g_audioReplacementOutput];
             [g_audioReader startReading];
-            g_micAudioFormat = format; g_audioInjectionReady = YES;
+            g_micAudioFormat = format;
+            g_audioInjectionReady = YES;
             ensureRingBufferAllocated();
-            g_audioRingBufferReadPos = 0; g_audioRingBufferWritePos = 0; g_audioRingBufferAvailable = 0;
+            g_audioRingBufferReadPos = 0;
+            g_audioRingBufferWritePos = 0;
+            g_audioRingBufferAvailable = 0;
             fillRingBufferFromVideo();
         }
-    } @catch (NSException *e) { NSLog(@"[VCAM] 音频注入初始化失败: %@", e); }
+    } @catch (NSException *e) {
+        NSLog(@"[VCAM] 音频注入初始化失败: %@", e);
+    }
 }
 
-// GetFrame
+// ===== GetFrame =====
 @interface GetFrame : NSObject
 + (CMSampleBufferRef _Nullable)getCurrentFrame:(CMSampleBufferRef)originSampleBuffer :(BOOL)forceReNew;
 + (UIWindow*)getKeyWindow;
 @end
 
 @implementation GetFrame
+
 + (CMSampleBufferRef _Nullable)getCurrentFrame:(CMSampleBufferRef _Nullable)originSampleBuffer :(BOOL)forceReNew {
     @try {
         static CMSampleBufferRef sampleBuffer = nil;
         CMFormatDescriptionRef formatDescription = nil;
-        CMMediaType mediaType = -; CMMediaType subMediaType = -1;
+        CMMediaType mediaType = -1;
+        CMMediaType subMediaType = -1;
+
         if (originSampleBuffer != nil) {
             formatDescription = CMSampleBufferGetFormatDescription(originSampleBuffer);
             mediaType = CMFormatDescriptionGetMediaType(formatDescription);
             subMediaType = CMFormatDescriptionGetMediaSubType(formatDescription);
             if (mediaType != kCMMediaType_Video) return originSampleBuffer;
         }
+
         if ([g_fileManager fileExistsAtPath:g_tempFile] == NO) return nil;
         if (sampleBuffer != nil && !g_canReleaseBuffer && CMSampleBufferIsValid(sampleBuffer) && forceReNew != YES) return sampleBuffer;
+
         static NSTimeInterval renewTime = 0;
         if ([g_fileManager fileExistsAtPath:[NSString stringWithFormat:@"%@.new", g_tempFile]]) {
             NSTimeInterval nowTime = [[NSDate date] timeIntervalSince1970];
-            if (nowTime - renewTime > 3) { renewTime = nowTime; g_bufferReload = YES; }
+            if (nowTime - renewTime > 3) {
+                renewTime = nowTime;
+                g_bufferReload = YES;
+            }
         }
+
         if (g_bufferReload) {
             g_bufferReload = NO;
             @try {
@@ -149,28 +184,46 @@ static void setupAudioInjectionWithFormat(AudioStreamBasicDescription format) {
                 reader = [AVAssetReader assetReaderWithAsset:asset error:nil];
                 AVAssetTrack *videoTrack = [[asset tracksWithMediaType:AVMediaTypeVideo] firstObject];
                 if (!videoTrack) return nil;
+
                 videoTrackout_32BGRA = [[AVAssetReaderTrackOutput alloc] initWithTrack:videoTrack outputSettings:@{(id)kCVPixelBufferPixelFormatTypeKey:@(kCVPixelFormatType_32BGRA)}];
                 videoTrackout_420YpCbCr8BiPlanarVideoRange = [[AVAssetReaderTrackOutput alloc] initWithTrack:videoTrack outputSettings:@{(id)kCVPixelBufferPixelFormatTypeKey:@(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange)}];
                 videoTrackout_420YpCbCr8BiPlanarFullRange = [[AVAssetReaderTrackOutput alloc] initWithTrack:videoTrack outputSettings:@{(id)kCVPixelBufferPixelFormatTypeKey:@(kCVPixelFormatType_420YpCbCr8BiPlanarFullRange)}];
-                [reader addOutput:videoTrackout_32BGRA]; [reader addOutput:videoTrackout_420YpCbCr8BiPlanarVideoRange]; [reader addOutput:videoTrackout_420YpCbCr8BiPlanarFullRange];
+
+                [reader addOutput:videoTrackout_32BGRA];
+                [reader addOutput:videoTrackout_420YpCbCr8BiPlanarVideoRange];
+                [reader addOutput:videoTrackout_420YpCbCr8BiPlanarFullRange];
                 [reader startReading];
-            } @catch (NSException *except) { NSLog(@"[VCAM] 初始化读取视频出错:%@", except); }
+            } @catch (NSException *except) {
+                NSLog(@"[VCAM] 初始化读取视频出错:%@", except);
+            }
         }
+
         CMSampleBufferRef videoTrackout_32BGRA_Buffer = [videoTrackout_32BGRA copyNextSampleBuffer];
         CMSampleBufferRef videoTrackout_420YpCbCr8BiPlanarVideoRange_Buffer = [videoTrackout_420YpCbCr8BiPlanarVideoRange copyNextSampleBuffer];
         CMSampleBufferRef videoTrackout_420YpCbCr8BiPlanarFullRange_Buffer = [videoTrackout_420YpCbCr8BiPlanarFullRange copyNextSampleBuffer];
+
         CMSampleBufferRef newsampleBuffer = nil;
         switch(subMediaType) {
-            case kCVPixelFormatType_32BGRA: CMSampleBufferCreateCopy(kCFAllocatorDefault, videoTrackout_32BGRA_Buffer, &newsampleBuffer); break;
-            case kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange: CMSampleBufferCreateCopy(kCFAllocatorDefault, videoTrackout_420YpCbCr8BiPlanarVideoRange_Buffer, &newsampleBuffer); break;
-            case kCVPixelFormatType_420YpCbCr8BiPlanarFullRange: CMSampleBufferCreateCopy(kCFAllocatorDefault, videoTrackout_420YpCbCr8BiPlanarFullRange_Buffer, &newsampleBuffer); break;
-            default: CMSampleBufferCreateCopy(kCFAllocatorDefault, videoTrackout_32BGRA_Buffer, &newsampleBuffer);
+            case kCVPixelFormatType_32BGRA:
+                CMSampleBufferCreateCopy(kCFAllocatorDefault, videoTrackout_32BGRA_Buffer, &newsampleBuffer);
+                break;
+            case kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange:
+                CMSampleBufferCreateCopy(kCFAllocatorDefault, videoTrackout_420YpCbCr8BiPlanarVideoRange_Buffer, &newsampleBuffer);
+                break;
+            case kCVPixelFormatType_420YpCbCr8BiPlanarFullRange:
+                CMSampleBufferCreateCopy(kCFAllocatorDefault, videoTrackout_420YpCbCr8BiPlanarFullRange_Buffer, &newsampleBuffer);
+                break;
+            default:
+                CMSampleBufferCreateCopy(kCFAllocatorDefault, videoTrackout_32BGRA_Buffer, &newsampleBuffer);
         }
+
         if (videoTrackout_32BGRA_Buffer) CFRelease(videoTrackout_32BGRA_Buffer);
         if (videoTrackout_420YpCbCr8BiPlanarVideoRange_Buffer) CFRelease(videoTrackout_420YpCbCr8BiPlanarVideoRange_Buffer);
         if (videoTrackout_420YpCbCr8BiPlanarFullRange_Buffer) CFRelease(videoTrackout_420YpCbCr8BiPlanarFullRange_Buffer);
-        if (newsampleBuffer == nil) { g_bufferReload = YES; }
-        else {
+
+        if (newsampleBuffer == nil) {
+            g_bufferReload = YES;
+        } else {
             if (sampleBuffer) CFRelease(sampleBuffer);
             if (originSampleBuffer != nil) {
                 CMSampleBufferRef copyBuffer = nil;
@@ -180,32 +233,43 @@ static void setupAudioInjectionWithFormat(AudioStreamBasicDescription format) {
                     .presentationTimeStamp = CMSampleBufferGetPresentationTimeStamp(originSampleBuffer),
                     .decodeTimeStamp = CMSampleBufferGetDecodeTimeStamp(originSampleBuffer)
                 };
-                CMVideoFormatDescriptionRef videoInfo = nil; CMVideoFormatDescriptionCreateForImageBuffer(kCFAllocatorDefault, pixelBuffer, &videoInfo);
+                CMVideoFormatDescriptionRef videoInfo = nil;
+                CMVideoFormatDescriptionCreateForImageBuffer(kCFAllocatorDefault, pixelBuffer, &videoInfo);
                 CMSampleBufferCreateForImageBuffer(kCFAllocatorDefault, pixelBuffer, true, nil, nil, videoInfo, &sampleTime, &copyBuffer);
                 if (copyBuffer) {
-                    CFDictionaryRef exif = CMGetAttachment(originSampleBuffer, (CFStringRef)@"{Exif}", NULL);
-                    CFDictionaryRef tiff = CMGetAttachment(originSampleBuffer, (CFStringRef)@"{TIFF}", NULL);
-                    if (exif) CMSetAttachment(copyBuffer, (CFStringRef)@"{Exif}", exif, kCMAttachmentMode_ShouldPropagate);
-                    if (tiff) CMSetAttachment(copyBuffer, (CFStringRef)@"{TIFF}", tiff, kCMAttachmentMode_ShouldPropagate);
+                    CFDictionaryRef exifAttachments = CMGetAttachment(originSampleBuffer, (CFStringRef)@"{Exif}", NULL);
+                    CFDictionaryRef TIFFAttachments = CMGetAttachment(originSampleBuffer, (CFStringRef)@"{TIFF}", NULL);
+                    if (exifAttachments) CMSetAttachment(copyBuffer, (CFStringRef)@"{Exif}", exifAttachments, kCMAttachmentMode_ShouldPropagate);
+                    if (exifAttachments) CMSetAttachment(copyBuffer, (CFStringRef)@"{TIFF}", TIFFAttachments, kCMAttachmentMode_ShouldPropagate);
                     sampleBuffer = copyBuffer;
                 }
                 CFRelease(newsampleBuffer);
-            } else { sampleBuffer = newsampleBuffer; }
+            } else {
+                sampleBuffer = newsampleBuffer;
+            }
         }
+
         if (sampleBuffer && CMSampleBufferIsValid(sampleBuffer)) return sampleBuffer;
         return nil;
-    } @catch (NSException *e) { NSLog(@"[VCAM] getCurrentFrame 异常: %@", e); return nil; }
+    } @catch (NSException *e) {
+        NSLog(@"[VCAM] getCurrentFrame 异常: %@", e);
+        return nil;
+    }
 }
+
 + (UIWindow*)getKeyWindow {
     UIWindow *keyWindow = nil;
     for (UIWindow *window in UIApplication.sharedApplication.windows) {
-        if (window.isKeyWindow) { keyWindow = window; break; }
+        if (window.isKeyWindow) {
+            keyWindow = window;
+            break;
+        }
     }
     return keyWindow;
 }
 @end
 
-// 视频 Hook
+// ===== 视频 Hook =====
 CALayer *g_maskLayer = nil;
 
 %hook AVCaptureVideoPreviewLayer
@@ -218,25 +282,32 @@ CALayer *g_maskLayer = nil;
     }
     if (![[self sublayers] containsObject:g_previewLayer]) {
         g_previewLayer = [[AVSampleBufferDisplayLayer alloc] init];
-        g_maskLayer = [CALayer new]; g_maskLayer.backgroundColor = [UIColor blackColor].CGColor;
-        [self insertSublayer:g_maskLayer above:layer]; [self insertSublayer:g_previewLayer above:g_maskLayer];
+        g_maskLayer = [CALayer new];
+        g_maskLayer.backgroundColor = [UIColor blackColor].CGColor;
+        [self insertSublayer:g_maskLayer above:layer];
+        [self insertSublayer:g_previewLayer above:g_maskLayer];
         dispatch_async(dispatch_get_main_queue(), ^{
             g_previewLayer.frame = [UIApplication sharedApplication].keyWindow.bounds;
             g_maskLayer.frame = [UIApplication sharedApplication].keyWindow.bounds;
         });
     }
 }
+
 %new
 - (void)step:(CADisplayLink *)sender {
     if ([g_fileManager fileExistsAtPath:g_tempFile]) {
         if (g_maskLayer) g_maskLayer.opacity = 1;
-        if (g_previewLayer) { g_previewLayer.opacity = 1; [g_previewLayer setVideoGravity:AVLayerVideoGravityResizeAspectFill]; }
+        if (g_previewLayer) {
+            g_previewLayer.opacity = 1;
+            [g_previewLayer setVideoGravity:AVLayerVideoGravityResizeAspectFill];
+        }
     } else {
         if (g_maskLayer) g_maskLayer.opacity = 0;
         if (g_previewLayer) g_previewLayer.opacity = 0;
     }
     if (g_cameraRunning && g_previewLayer) {
-        g_previewLayer.frame = self.bounds; g_previewLayer.transform = CATransform3DIdentity;
+        g_previewLayer.frame = self.bounds;
+        g_previewLayer.transform = CATransform3DIdentity;
         static NSTimeInterval refreshTime = 0;
         NSTimeInterval nowTime = [[NSDate date] timeIntervalSince1970] * 1000;
         if (nowTime - g_refreshPreviewByVideoDataOutputTime > 1000) {
@@ -254,23 +325,34 @@ CALayer *g_maskLayer = nil;
         }
     }
     NSTimeInterval currentTime = [[NSDate date] timeIntervalSince1970];
-    if (currentTime - g_lastBufferRefreshTime > BUFFER_REFRESH_INTERVAL) { g_lastBufferRefreshTime = currentTime; g_bufferReload = YES; }
+    if (currentTime - g_lastBufferRefreshTime > BUFFER_REFRESH_INTERVAL) {
+        g_lastBufferRefreshTime = currentTime;
+        g_bufferReload = YES;
+    }
 }
 %end
 
 %hook AVCaptureSession
 - (void)startRunning {
-    g_cameraRunning = YES; g_bufferReload = YES;
+    g_cameraRunning = YES;
+    g_bufferReload = YES;
     g_lastBufferRefreshTime = [[NSDate date] timeIntervalSince1970];
     g_refreshPreviewByVideoDataOutputTime = g_lastBufferRefreshTime * 1000;
     %orig;
 }
-- (void)stopRunning { g_cameraRunning = NO; %orig; }
-- (void)addInput:(AVCaptureDeviceInput *)input {
-    if ([[input device] position] > 0) g_cameraPosition = [[input device] position] == 1 ? @"B" : @"F";
+- (void)stopRunning {
+    g_cameraRunning = NO;
     %orig;
 }
-- (void)addOutput:(AVCaptureOutput *)output { %orig; }
+- (void)addInput:(AVCaptureDeviceInput *)input {
+    if ([[input device] position] > 0) {
+        g_cameraPosition = [[input device] position] == 1 ? @"B" : @"F";
+    }
+    %orig;
+}
+- (void)addOutput:(AVCaptureOutput *)output {
+    %orig;
+}
 %end
 
 %hook AVCaptureStillImageOutput
@@ -279,10 +361,12 @@ CALayer *g_maskLayer = nil;
     void (^newHandler)(CMSampleBufferRef imageDataSampleBuffer, NSError *error) = ^(CMSampleBufferRef imageDataSampleBuffer, NSError *error) {
         CMSampleBufferRef newBuffer = [GetFrame getCurrentFrame:imageDataSampleBuffer :YES];
         if (newBuffer) imageDataSampleBuffer = newBuffer;
-        handler(imageDataSampleBuffer, error); g_canReleaseBuffer = YES;
+        handler(imageDataSampleBuffer, error);
+        g_canReleaseBuffer = YES;
     };
     %orig(connection, [newHandler copy]);
 }
+
 + (NSData *)jpegStillImageNSDataRepresentation:(CMSampleBufferRef)jpegSampleBuffer {
     CMSampleBufferRef newBuffer = [GetFrame getCurrentFrame:nil :NO];
     if (newBuffer) {
@@ -306,42 +390,60 @@ CALayer *g_maskLayer = nil;
     }
     return %orig;
 }
+
 - (void)capturePhotoWithSettings:(AVCapturePhotoSettings *)settings delegate:(id<AVCapturePhotoCaptureDelegate>)delegate {
     if (settings == nil || delegate == nil) return %orig;
-    if (g_isIOS15OrLater && @available(iOS 15.0, *)) {
-        if ([delegate respondsToSelector:@selector(captureOutput:didFinishProcessingPhoto:error:)]) {
-            static NSMutableArray *hooked; if (!hooked) hooked = [NSMutableArray new];
-            NSString *cls = NSStringFromClass([delegate class]);
-            if (![hooked containsObject:cls]) {
-                [hooked addObject:cls];
-                __block void (*orig)(id, SEL, AVCapturePhotoOutput *, AVCapturePhoto *, NSError *) = nil;
-                MSHookMessageEx([delegate class], @selector(captureOutput:didFinishProcessingPhoto:error:), imp_implementationWithBlock(^(id self, AVCapturePhotoOutput *co, AVCapturePhoto *ph, NSError *er) {
-                    @try {
-                        if (![g_fileManager fileExistsAtPath:g_tempFile]) return orig(self, @selector(captureOutput:didFinishProcessingPhoto:error:), co, ph, er);
-                        g_canReleaseBuffer = NO;
-                        static CMSampleBufferRef cb = nil; CMSampleBufferRef tb = nil; CVPixelBufferRef tp = ph.pixelBuffer;
-                        CMSampleTimingInfo st = {0}; CMVideoFormatDescriptionRef vi = nil;
-                        CMVideoFormatDescriptionCreateForImageBuffer(kCFAllocatorDefault, tp, &vi);
-                        CMSampleBufferCreateForImageBuffer(kCFAllocatorDefault, tp, true, nil, nil, vi, &st, &tb);
-                        CMSampleBufferRef nb = [GetFrame getCurrentFrame:tb :YES]; if (tb) CFRelease(tb);
-                        if (nb) {
-                            if (cb) CFRelease(cb); CMSampleBufferCreateCopy(kCFAllocatorDefault, nb, &cb);
-                            __block CVImageBufferRef ib = CMSampleBufferGetImageBuffer(cb);
-                            CIImage *ci = [CIImage imageWithCVImageBuffer:ib]; UIImage *ui = [UIImage imageWithCIImage:ci];
-                            __block NSData *nd = UIImageJPEGRepresentation(ui, 1);
-                            __block NSData *(*fdrwc)(id, SEL, id<AVCapturePhotoFileDataRepresentationCustomizer>) = nil;
-                            MSHookMessageEx([ph class], @selector(fileDataRepresentationWithCustomizer:), imp_implementationWithBlock(^(id s, id<AVCapturePhotoFileDataRepresentationCustomizer> c) {
-                                if ([g_fileManager fileExistsAtPath:g_tempFile]) return nd; return fdrwc(s, @selector(fileDataRepresentationWithCustomizer:), c);
-                            }), (IMP*)&fdrwc);
-                            __block NSData *(*fdr)(id, SEL) = nil;
-                            MSHookMessageEx([ph class], @selector(fileDataRepresentation), imp_implementationWithBlock(^(id s, SEL c) {
-                                if ([g_fileManager fileExistsAtPath:g_tempFile]) return nd; return fdr(s, @selector(fileDataRepresentation));
-                            }), (IMP*)&fdr);
+    if (g_isIOS15OrLater) {
+        if (@available(iOS 15.0, *)) {
+            if ([delegate respondsToSelector:@selector(captureOutput:didFinishProcessingPhoto:error:)]) {
+                static NSMutableArray *hooked;
+                if (hooked == nil) hooked = [NSMutableArray new];
+                NSString *className = NSStringFromClass([delegate class]);
+                if ([hooked containsObject:className] == NO) {
+                    [hooked addObject:className];
+                    __block void (*original_method)(id, SEL, AVCapturePhotoOutput *, AVCapturePhoto *, NSError *) = nil;
+                    MSHookMessageEx([delegate class], @selector(captureOutput:didFinishProcessingPhoto:error:), imp_implementationWithBlock(^(id self, AVCapturePhotoOutput *captureOutput, AVCapturePhoto *photo, NSError *error) {
+                        @try {
+                            if (![g_fileManager fileExistsAtPath:g_tempFile]) {
+                                return original_method(self, @selector(captureOutput:didFinishProcessingPhoto:error:), captureOutput, photo, error);
+                            }
+                            g_canReleaseBuffer = NO;
+                            static CMSampleBufferRef copyBuffer = nil;
+                            CMSampleBufferRef tempBuffer = nil;
+                            CVPixelBufferRef tempPixelBuffer = photo.pixelBuffer;
+                            CMSampleTimingInfo sampleTime = {0};
+                            CMVideoFormatDescriptionRef videoInfo = nil;
+                            CMVideoFormatDescriptionCreateForImageBuffer(kCFAllocatorDefault, tempPixelBuffer, &videoInfo);
+                            CMSampleBufferCreateForImageBuffer(kCFAllocatorDefault, tempPixelBuffer, true, nil, nil, videoInfo, &sampleTime, &tempBuffer);
+                            CMSampleBufferRef newBuffer = [GetFrame getCurrentFrame:tempBuffer :YES];
+                            if (tempBuffer) CFRelease(tempBuffer);
+                            if (newBuffer) {
+                                if (copyBuffer) CFRelease(copyBuffer);
+                                CMSampleBufferCreateCopy(kCFAllocatorDefault, newBuffer, &copyBuffer);
+                                __block CVImageBufferRef imageBuffer = CMSampleBufferGetImageBuffer(copyBuffer);
+                                CIImage *ciimage = [CIImage imageWithCVImageBuffer:imageBuffer];
+                                UIImage *uiimage = [UIImage imageWithCIImage:ciimage];
+                                __block NSData *theNewPhoto = UIImageJPEGRepresentation(uiimage, 1);
+
+                                __block NSData *(*fileDataRepresentationWithCustomizer)(id, SEL, id<AVCapturePhotoFileDataRepresentationCustomizer>) = nil;
+                                MSHookMessageEx([photo class], @selector(fileDataRepresentationWithCustomizer:), imp_implementationWithBlock(^(id s, id<AVCapturePhotoFileDataRepresentationCustomizer> c) {
+                                    if ([g_fileManager fileExistsAtPath:g_tempFile]) return theNewPhoto;
+                                    return fileDataRepresentationWithCustomizer(s, @selector(fileDataRepresentationWithCustomizer:), c);
+                                }), (IMP*)&fileDataRepresentationWithCustomizer);
+
+                                __block NSData *(*fileDataRepresentation)(id, SEL) = nil;
+                                MSHookMessageEx([photo class], @selector(fileDataRepresentation), imp_implementationWithBlock(^(id s, SEL c) {
+                                    if ([g_fileManager fileExistsAtPath:g_tempFile]) return theNewPhoto;
+                                    return fileDataRepresentation(s, @selector(fileDataRepresentation));
+                                }), (IMP*)&fileDataRepresentation);
+                            }
+                            g_canReleaseBuffer = YES;
+                        } @catch (NSException *e) {
+                            NSLog(@"[VCAM] photo hook 异常: %@", e);
                         }
-                        g_canReleaseBuffer = YES;
-                    } @catch (NSException *e) { NSLog(@"[VCAM] photo hook 异常: %@", e); }
-                    return orig(self, @selector(captureOutput:didFinishProcessingPhoto:error:), co, ph, er);
-                }), (IMP*)&orig);
+                        return original_method(self, @selector(captureOutput:didFinishProcessingPhoto:error:), captureOutput, photo, error);
+                    }), (IMP*)&original_method);
+                }
             }
         }
     }
@@ -350,71 +452,115 @@ CALayer *g_maskLayer = nil;
 %end
 
 %hook AVCaptureVideoDataOutput
-- (void)setSampleBufferDelegate:(id<AVCaptureVideoDataOutputSampleBufferDelegate>)delegate queue:(dispatch_queue_t)queue {
-    if (!delegate || !queue) return %orig;
-    static NSMutableArray *hooked; if (!hooked) hooked = [NSMutableArray new];
-    NSString *cls = NSStringFromClass([delegate class]);
-    if (![hooked containsObject:cls]) {
-        [hooked addObject:cls];
-        __block void (*orig)(id, SEL, AVCaptureOutput *, CMSampleBufferRef, AVCaptureConnection *) = nil;
-        MSHookMessageEx([delegate class], @selector(captureOutput:didOutputSampleBuffer:fromConnection:), imp_implementationWithBlock(^(id self, AVCaptureOutput *o, CMSampleBufferRef sb, AVCaptureConnection *c) {
+- (void)setSampleBufferDelegate:(id<AVCaptureVideoDataOutputSampleBufferDelegate>)sampleBufferDelegate queue:(dispatch_queue_t)sampleBufferCallbackQueue {
+    if (sampleBufferDelegate == nil || sampleBufferCallbackQueue == nil) return %orig;
+    static NSMutableArray *hooked;
+    if (hooked == nil) hooked = [NSMutableArray new];
+    NSString *className = NSStringFromClass([sampleBufferDelegate class]);
+    if ([hooked containsObject:className] == NO) {
+        [hooked addObject:className];
+        __block void (*original_method)(id, SEL, AVCaptureOutput *, CMSampleBufferRef, AVCaptureConnection *) = nil;
+        MSHookMessageEx([sampleBufferDelegate class], @selector(captureOutput:didOutputSampleBuffer:fromConnection:), imp_implementationWithBlock(^(id self, AVCaptureOutput *output, CMSampleBufferRef sampleBuffer, AVCaptureConnection *connection) {
             @try {
                 g_refreshPreviewByVideoDataOutputTime = ([[NSDate date] timeIntervalSince1970]) * 1000;
-                CMSampleBufferRef nb = [GetFrame getCurrentFrame:sb :NO];
-                g_photoOrientation = [c videoOrientation];
-                if (nb && g_previewLayer && g_previewLayer.readyForMoreMediaData) { [g_previewLayer flush]; [g_previewLayer enqueueSampleBuffer:nb]; }
-                return orig(self, @selector(captureOutput:didOutputSampleBuffer:fromConnection:), o, nb ?: sb, c);
-            } @catch (NSException *e) { NSLog(@"[VCAM] videoDataOutput hook 异常: %@", e); return orig(self, @selector(captureOutput:didOutputSampleBuffer:fromConnection:), o, sb, c); }
-        }), (IMP*)&orig);
+                CMSampleBufferRef newBuffer = [GetFrame getCurrentFrame:sampleBuffer :NO];
+                g_photoOrientation = [connection videoOrientation];
+                if (newBuffer && g_previewLayer && g_previewLayer.readyForMoreMediaData) {
+                    [g_previewLayer flush];
+                    [g_previewLayer enqueueSampleBuffer:newBuffer];
+                }
+                return original_method(self, @selector(captureOutput:didOutputSampleBuffer:fromConnection:), output, newBuffer ?: sampleBuffer, connection);
+            } @catch (NSException *e) {
+                NSLog(@"[VCAM] videoDataOutput hook 异常: %@", e);
+                return original_method(self, @selector(captureOutput:didOutputSampleBuffer:fromConnection:), output, sampleBuffer, connection);
+            }
+        }), (IMP*)&original_method);
     }
     %orig;
 }
 %end
 
-// 音频 Hook
+// ===== 音频 Hook =====
 static OSStatus (*AudioUnitRender_orig)(AudioUnit, AudioUnitRenderActionFlags *, const AudioTimeStamp *, UInt32, UInt32, AudioBufferList *) = NULL;
+
 static OSStatus AudioUnitRender_hook(AudioUnit inUnit, AudioUnitRenderActionFlags *ioActionFlags, const AudioTimeStamp *inTimeStamp, UInt32 inOutputBusNumber, UInt32 inNumberFrames, AudioBufferList *ioData) {
     OSStatus status = AudioUnitRender_orig(inUnit, ioActionFlags, inTimeStamp, inOutputBusNumber, inNumberFrames, ioData);
     @try {
         if (status != noErr || inOutputBusNumber != 1 || !g_audioEnabled) return status;
+
         if (!g_audioInjectionReady) {
             if (ioData && ioData->mNumberBuffers > 0) {
                 AudioBuffer *buf = &ioData->mBuffers[0];
-                g_micAudioFormat.mSampleRate = 44100.0; g_micAudioFormat.mChannelsPerFrame = buf->mNumberChannels;
-                g_micAudioFormat.mBitsPerChannel = 16; g_micAudioFormat.mFormatID = kAudioFormatLinearPCM;
+                g_micAudioFormat.mSampleRate = 44100.0;
+                g_micAudioFormat.mChannelsPerFrame = buf->mNumberChannels;
+                g_micAudioFormat.mBitsPerChannel = 16;
+                g_micAudioFormat.mFormatID = kAudioFormatLinearPCM;
                 g_micAudioFormat.mFormatFlags = kAudioFormatFlagIsSignedInteger | kAudioFormatFlagIsPacked;
                 g_micAudioFormat.mBytesPerFrame = g_micAudioFormat.mChannelsPerFrame * sizeof(int16_t);
-                g_micAudioFormat.mFramesPerPacket = 1; g_micAudioFormat.mBytesPerPacket = g_micAudioFormat.mBytesPerFrame;
+                g_micAudioFormat.mFramesPerPacket = 1;
+                g_micAudioFormat.mBytesPerPacket = g_micAudioFormat.mBytesPerFrame;
                 setupAudioInjectionWithFormat(g_micAudioFormat);
             }
             if (!g_audioInjectionReady) return status;
         }
+
         if (ioData && ioData->mNumberBuffers > 0) {
-            AudioBuffer *buf = &ioData->mBuffers[0]; int16_t *out = (int16_t *)buf->mData; int need = inNumberFrames * buf->mNumberChannels;
+            AudioBuffer *buf = &ioData->mBuffers[0];
+            int16_t *out = (int16_t *)buf->mData;
+            int need = inNumberFrames * buf->mNumberChannels;
             for (int i = 0; i < need; i++) {
                 if (g_audioRingBufferAvailable > 0) {
                     out[i] = g_audioRingBuffer[g_audioRingBufferReadPos];
-                    g_audioRingBufferReadPos = (g_audioRingBufferReadPos + 1) % AUDIO_RING_BUFFER_SIZE; g_audioRingBufferAvailable--;
-                } else out[i] = 0;
+                    g_audioRingBufferReadPos = (g_audioRingBufferReadPos + 1) % AUDIO_RING_BUFFER_SIZE;
+                    g_audioRingBufferAvailable--;
+                } else {
+                    out[i] = 0;
+                }
             }
-            if (g_audioRingBufferAvailable < 4800) { dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{ fillRingBufferFromVideo(); }); }
+            if (g_audioRingBufferAvailable < 4800) {
+                dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+                    fillRingBufferFromVideo();
+                });
+            }
         }
-    } @catch (NSException *e) { NSLog(@"[VCAM] 音频 hook 异常: %@", e); }
+    } @catch (NSException *e) {
+        NSLog(@"[VCAM] 音频 hook 异常: %@", e);
+    }
     return status;
 }
 
+// ===== 初始化 =====
 %ctor {
     g_isMirroredMark = [NSString stringWithUTF8String:jbroot("/var/mobile/Library/Caches/vcam_is_mirrored_mark")];
     g_tempFile = [NSString stringWithUTF8String:jbroot("/var/mobile/Library/Caches/temp.mov")];
+
     if ([[NSProcessInfo processInfo] isOperatingSystemAtLeastVersion:(NSOperatingSystemVersion){15, 0, 0}]) g_isIOS15OrLater = YES;
     g_fileManager = [NSFileManager defaultManager];
+
     updatePreferences();
-    CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), NULL, prefsChanged, CFSTR("com.trizau.sileo.vcam.prefschanged"), NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
+
+    CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(),
+                                    NULL,
+                                    prefsChanged,
+                                    CFSTR("com.trizau.sileo.vcam.prefschanged"),
+                                    NULL,
+                                    CFNotificationSuspensionBehaviorDeliverImmediately);
+
     MSHookFunction((void *)AudioUnitRender, (void *)AudioUnitRender_hook, (void **)&AudioUnitRender_orig);
 }
+
 %dtor {
-    g_fileManager = nil; g_canReleaseBuffer = YES; g_bufferReload = YES; g_previewLayer = nil;
-    g_refreshPreviewByVideoDataOutputTime = 0; g_cameraRunning = NO;
-    if (g_audioRingBuffer) { free(g_audioRingBuffer); g_audioRingBuffer = NULL; }
-    g_audioReader = nil; g_audioReplacementOutput = nil; g_audioInjectionReady = NO;
+    g_fileManager = nil;
+    g_canReleaseBuffer = YES;
+    g_bufferReload = YES;
+    g_previewLayer = nil;
+    g_refreshPreviewByVideoDataOutputTime = 0;
+    g_cameraRunning = NO;
+    if (g_audioRingBuffer) {
+        free(g_audioRingBuffer);
+        g_audioRingBuffer = NULL;
+    }
+    g_audioReader = nil;
+    g_audioReplacementOutput = nil;
+    g_audioInjectionReady = NO;
 }
