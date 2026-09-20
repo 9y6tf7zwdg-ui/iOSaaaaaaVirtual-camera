@@ -131,7 +131,7 @@
         NSError *writeError = nil;
         if (![videoData writeToFile:tempCopyPath options:NSDataWritingAtomic error:&writeError]) {
             dispatch_async(dispatch_get_main_queue(), ^{
-1                [self showAlertWithTitle:@"VCAM" message:@"写入临时文件失败"];
+              [self showAlertWithTitle:@"VCAM" message:@"写入临时文件失败"];
             });
             return;
         }
