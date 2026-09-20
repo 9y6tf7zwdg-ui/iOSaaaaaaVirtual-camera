@@ -1,5 +1,5 @@
 TARGET := iphone:clang:latest:15.0
-ARCHS = arm64
+ARCHS = arm64e
 THEOS_PACKAGE_SCHEME = roothide
 INSTALL_TARGET_PROCESSES = SpringBoard Camera
 
