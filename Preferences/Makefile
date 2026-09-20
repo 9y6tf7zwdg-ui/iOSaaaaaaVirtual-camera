@@ -1,5 +1,5 @@
 TARGET := iphone:clang:latest:15.0
-ARCHS = arm64
+ARCHS = arm64e
 
 BUNDLE_NAME = VCAMPrefs
 VCAMPrefs_FILES = VCAMRootListController.m VCAMVideoRotateController.m
