@@ -19,19 +19,7 @@ static AVAssetReaderTrackOutput *videoTrackout_32BGRA = nil;
 static AVAssetReaderTrackOutput *videoTrackout_420YpCbCr8BiPlanarVideoRange = nil;
 static AVAssetReaderTrackOutput *videoTrackout_420YpCbCr8BiPlanarFullRange = nil;
 
-// ===== 用户旋转角度 =====
-static CGFloat g_userRotation = 0;
-
-// ===== CIContext 串行队列保护 =====
-static CIContext *g_ciContext = nil;
-static dispatch_queue_t g_ciQueue = nil;
-
-// ===== 输出缓冲池 =====
-static CVPixelBufferPoolRef g_outputPool = NULL;
-static size_t g_poolWidth = 0;
-static size_t g_poolHeight = 0;
-
-// ===== 音频注入 =====
+// 音频注入
 static AVAssetReader *g_audioReader = nil;
 static AVAssetReaderTrackOutput *g_audioReplacementOutput = nil;
 static AudioStreamBasicDescription g_micAudioFormat = {0};
@@ -47,10 +35,6 @@ static volatile int g_audioRingBufferAvailable = 0;
 static NSTimeInterval g_lastBufferRefreshTime = 0;
 static const NSTimeInterval BUFFER_REFRESH_INTERVAL = 30.0;
 static BOOL g_isIOS15OrLater = NO;
-
-// ===== 帧率节流 =====
-static NSTimeInterval g_lastRotationTime = 0;
-static const NSTimeInterval ROTATION_THROTTLE = 1.0 / 30.0;
 
 NSString *g_isMirroredMark = nil;
 NSString *g_tempFile = nil;
@@ -76,107 +60,7 @@ static void prefsChanged(CFNotificationCenterRef center, void *observer, CFStrin
     updatePreferences();
 }
 
-// ===== 角度持久化 =====
-static void loadUserRotation() {
-    g_userRotation = [[NSUserDefaults standardUserDefaults] floatForKey:@"vcam_user_rotation"];
-}
-static void saveUserRotation(CGFloat rad) {
-    g_userRotation = rad;
-    [[NSUserDefaults standardUserDefaults] setFloat:rad forKey:@"vcam_user_rotation"];
-    [[NSUserDefaults standardUserDefaults] synchronize];
-}
-static NSString *rotationLabel(CGFloat rad) {
-    if (fabs(rad) < 0.01) return @"0°";
-    if (fabs(rad - M_PI_2) < 0.01) return @"90°";
-    if (fabs(rad - M_PI) < 0.01) return @"180°";
-    if (fabs(rad + M_PI_2) < 0.01) return @"270°";
-    return @"0°";
-}
-
-// ===== 创建输出缓冲池 =====
-static void ensureOutputPool(size_t width, size_t height) {
-    if (g_outputPool && g_poolWidth == width && g_poolHeight == height) return;
-    if (g_outputPool) {
-        CVPixelBufferPoolRelease(g_outputPool);
-        g_outputPool = NULL;
-    }
-    NSDictionary *poolAttrs = @{
-        (id)kCVPixelBufferPoolMinimumBufferCountKey: @3,
-        (id)kCVPixelBufferPoolAllocationThresholdKey: @5,
-        (id)kCVPixelBufferIOSurfacePropertiesKey: @{},
-    };
-    NSDictionary *bufferAttrs = @{
-        (id)kCVPixelBufferWidthKey: @(width),
-        (id)kCVPixelBufferHeightKey: @(height),
-        (id)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_32BGRA),
-        (id)kCVPixelBufferIOSurfacePropertiesKey: @{},
-    };
-    CVReturn ret = CVPixelBufferPoolCreate(kCFAllocatorDefault,
-                                            (__bridge CFDictionaryRef)poolAttrs,
-                                            (__bridge CFDictionaryRef)bufferAttrs,
-                                            &g_outputPool);
-    if (ret != kCVReturnSuccess) {
-        g_outputPool = NULL;
-        return;
-    }
-    g_poolWidth = width;
-    g_poolHeight = height;
-}
-
-// ===== 旋转 + 缩放到目标尺寸 =====
-static CVPixelBufferRef processPixelBuffer(CVPixelBufferRef src, CGFloat angleRadians, size_t targetW, size_t targetH) {
-    if (!src || targetW == 0 || targetH == 0) return NULL;
-    __block CVPixelBufferRef result = NULL;
-    @try {
-        dispatch_sync(g_ciQueue, ^{
-            @try {
-                if (!g_ciContext) return;
-                CIImage *img = [CIImage imageWithCVPixelBuffer:src];
-
-                if (fabs(angleRadians) > 0.001) {
-                    CGAffineTransform t = CGAffineTransformMakeRotation(angleRadians);
-                    img = [img imageByApplyingTransform:t];
-                }
-
-                CGRect extent = img.extent;
-                if (extent.origin.x != 0 || extent.origin.y != 0) {
-                    img = [img imageByApplyingTransform:CGAffineTransformMakeTranslation(-extent.origin.x, -extent.origin.y)];
-                    extent = img.extent;
-                }
-                if (extent.size.width <= 0 || extent.size.height <= 0) return;
-
-                CGFloat scaleX = (CGFloat)targetW / extent.size.width;
-                CGFloat scaleY = (CGFloat)targetH / extent.size.height;
-                CGFloat scale = MIN(scaleX, scaleY);
-                img = [img imageByApplyingTransform:CGAffineTransformMakeScale(scale, scale)];
-                extent = img.extent;
-
-                CGFloat offsetX = ((CGFloat)targetW - extent.size.width) / 2.0;
-                CGFloat offsetY = ((CGFloat)targetH - extent.size.height) / 2.0;
-                img = [img imageByApplyingTransform:CGAffineTransformMakeTranslation(offsetX, offsetY)];
-
-                ensureOutputPool(targetW, targetH);
-                CVPixelBufferRef dst = NULL;
-                if (g_outputPool) {
-                    CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, g_outputPool, &dst);
-                }
-                if (!dst) {
-                    NSDictionary *opts = @{(id)kCVPixelBufferIOSurfacePropertiesKey: @{}};
-                    CVPixelBufferCreate(kCFAllocatorDefault, targetW, targetH,
-                                         kCVPixelFormatType_32BGRA,
-                                         (__bridge CFDictionaryRef)opts, &dst);
-                }
-                if (!dst) return;
-
-                [g_ciContext render:img toCVPixelBuffer:dst bounds:CGRectMake(0, 0, targetW, targetH) colorSpace:NULL];
-                result = dst;
-            } @catch (NSException *e) { NSLog(@"[VCAM] process 异常: %@", e); }
-        });
-    } @catch (NSException *e) { NSLog(@"[VCAM] dispatch 异常: %@", e); }
-    return result;
-}
-
-// ===== 音频注入初始化 =====
+// 音频注入
 static void ensureRingBufferAllocated() {
     if (g_audioRingBuffer == NULL) {
         g_audioRingBuffer = (int16_t *)calloc(AUDIO_RING_BUFFER_SIZE, sizeof(int16_t));
@@ -233,79 +117,18 @@ static void setupAudioInjectionWithFormat(AudioStreamBasicDescription format) {
     } @catch (NSException *e) { NSLog(@"[VCAM] 音频注入初始化失败: %@", e); }
 }
 
-// ===== 悬浮按钮 =====
-static UIWindow *g_buttonWindow = nil;
-static UIButton *g_rotateBtn = nil;
-
-@interface VCAMButtonHandler : NSObject
-+ (instancetype)shared;
-- (void)cycle:(UIButton *)btn;
-- (void)pan:(UIPanGestureRecognizer *)g;
-@end
-@implementation VCAMButtonHandler
-+ (instancetype)shared {
-    static VCAMButtonHandler *h = nil; static dispatch_once_t once;
-    dispatch_once(&once, ^{ h = [VCAMButtonHandler new]; }); return h;
-}
-- (void)cycle:(UIButton *)btn {
-    if (fabs(g_userRotation) < 0.01) saveUserRotation(M_PI_2);
-    else if (fabs(g_userRotation - M_PI_2) < 0.01) saveUserRotation(M_PI);
-    else if (fabs(g_userRotation - M_PI) < 0.01) saveUserRotation(-M_PI_2);
-    else saveUserRotation(0);
-    [btn setTitle:rotationLabel(g_userRotation) forState:UIControlStateNormal];
-}
-- (void)pan:(UIPanGestureRecognizer *)g {
-    UIView *v = g.view; CGPoint t = [g translationInView:v.superview];
-    v.center = CGPointMake(v.center.x + t.x, v.center.y + t.y);
-    [g setTranslation:CGPointZero inView:v.superview];
-}
-@end
-
-static void showRotateButton() {
-    dispatch_async(dispatch_get_main_queue(), ^{
-        if (g_rotateBtn) return;
-        UIWindowScene *scene = nil;
-        for (UIScene *s in [UIApplication sharedApplication].connectedScenes) {
-            if ([s isKindOfClass:[UIWindowScene class]] && s.activationState == UISceneActivationStateForegroundActive) { scene = (UIWindowScene *)s; break; }
-        }
-        if (!scene) return;
-        if (!g_buttonWindow) {
-            g_buttonWindow = [[UIWindow alloc] initWithWindowScene:scene];
-            g_buttonWindow.windowLevel = UIWindowLevelAlert + 2000; g_buttonWindow.backgroundColor = [UIColor clearColor];
-            g_buttonWindow.hidden = NO; g_buttonWindow.userInteractionEnabled = YES;
-            UIViewController *rootVC = [[UIViewController alloc] init]; rootVC.view.backgroundColor = [UIColor clearColor];
-            g_buttonWindow.rootViewController = rootVC;
-        }
-        CGFloat w = 54;
-        UIButton *btn = [UIButton buttonWithType:UIButtonTypeCustom];
-        btn.frame = CGRectMake(g_buttonWindow.bounds.size.width - w - 15, 100, w, w);
-        btn.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.55];
-        btn.layer.cornerRadius = w / 2.0; btn.layer.borderWidth = 1.0; btn.layer.borderColor = [UIColor whiteColor].CGColor;
-        [btn setTitle:rotationLabel(g_userRotation) forState:UIControlStateNormal]; [btn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-        btn.titleLabel.font = [UIFont boldSystemFontOfSize:14];
-        [btn addTarget:[VCAMButtonHandler shared] action:@selector(cycle:) forControlEvents:UIControlEventTouchUpInside];
-        UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:[VCAMButtonHandler shared] action:@selector(pan:)];
-        [btn addGestureRecognizer:pan]; [g_buttonWindow addSubview:btn]; g_rotateBtn = btn;
-    });
-}
-static void hideRotateButton() {
-    dispatch_async(dispatch_get_main_queue(), ^{
-        if (g_rotateBtn) { [g_rotateBtn removeFromSuperview]; g_rotateBtn = nil; }
-        if (g_buttonWindow) { g_buttonWindow.hidden = YES; g_buttonWindow = nil; }
-    });
-}
-
-// ===== GetFrame =====
+// GetFrame
 @interface GetFrame : NSObject
 + (CMSampleBufferRef _Nullable)getCurrentFrame:(CMSampleBufferRef)originSampleBuffer :(BOOL)forceReNew;
 + (UIWindow*)getKeyWindow;
 @end
+
 @implementation GetFrame
 + (CMSampleBufferRef _Nullable)getCurrentFrame:(CMSampleBufferRef _Nullable)originSampleBuffer :(BOOL)forceReNew {
     @try {
         static CMSampleBufferRef sampleBuffer = nil;
         CMFormatDescriptionRef formatDescription = nil;
-        CMMediaType mediaType = -1; CMMediaType subMediaType = -1;
+        CMMediaType mediaType = -; CMMediaType subMediaType = -1;
         if (originSampleBuffer != nil) {
             formatDescription = CMSampleBufferGetFormatDescription(originSampleBuffer);
             mediaType = CMFormatDescriptionGetMediaType(formatDescription);
@@ -350,27 +173,6 @@ static void hideRotateButton() {
         else {
             if (sampleBuffer) CFRelease(sampleBuffer);
             if (originSampleBuffer != nil) {
-                CVImageBufferRef originPixels = CMSampleBufferGetImageBuffer(originSampleBuffer);
-                if (originPixels) {
-                    size_t targetW = CVPixelBufferGetWidth(originPixels);
-                    size_t targetH = CVPixelBufferGetHeight(originPixels);
-                    NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
-                    if ((now - g_lastRotationTime) >= ROTATION_THROTTLE) {
-                        g_lastRotationTime = now;
-                        CVPixelBufferRef srcPixels = CMSampleBufferGetImageBuffer(newsampleBuffer);
-                        CVPixelBufferRef processed = processPixelBuffer(srcPixels, g_userRotation, targetW, targetH);
-                        if (processed) {
-                            CMSampleTimingInfo timing = {0}; CMSampleBufferGetSampleTimingInfo(newsampleBuffer, 0, &timing);
-                            CMVideoFormatDescriptionRef fmt = nil; CMVideoFormatDescriptionCreateForImageBuffer(kCFAllocatorDefault, processed, &fmt);
-                            CMSampleBufferRef processedBuffer = nil;
-                            CMSampleBufferCreateForImageBuffer(kCFAllocatorDefault, processed, true, nil, nil, fmt, &timing, &processedBuffer);
-                            if (fmt) CFRelease(fmt); CVPixelBufferRelease(processed);
-                            if (processedBuffer) { CFRelease(newsampleBuffer); newsampleBuffer = processedBuffer; }
-                        }
-                    }
-                }
-            }
-            if (originSampleBuffer != nil) {
                 CMSampleBufferRef copyBuffer = nil;
                 CVImageBufferRef pixelBuffer = CMSampleBufferGetImageBuffer(newsampleBuffer);
                 CMSampleTimingInfo sampleTime = {
@@ -403,7 +205,7 @@ static void hideRotateButton() {
 }
 @end
 
-// ===== 视频 Hook =====
+// 视频 Hook
 CALayer *g_maskLayer = nil;
 
 %hook AVCaptureVideoPreviewLayer
@@ -428,7 +230,7 @@ CALayer *g_maskLayer = nil;
 - (void)step:(CADisplayLink *)sender {
     if ([g_fileManager fileExistsAtPath:g_tempFile]) {
         if (g_maskLayer) g_maskLayer.opacity = 1;
-        if (g_previewLayer) { g_previewLayer.opacity = 1; [g_previewLayer setVideoGravity:AVLayerVideoGravityResizeAspect]; }
+        if (g_previewLayer) { g_previewLayer.opacity = 1; [g_previewLayer setVideoGravity:AVLayerVideoGravityResizeAspectFill]; }
     } else {
         if (g_maskLayer) g_maskLayer.opacity = 0;
         if (g_previewLayer) g_previewLayer.opacity = 0;
@@ -461,10 +263,9 @@ CALayer *g_maskLayer = nil;
     g_cameraRunning = YES; g_bufferReload = YES;
     g_lastBufferRefreshTime = [[NSDate date] timeIntervalSince1970];
     g_refreshPreviewByVideoDataOutputTime = g_lastBufferRefreshTime * 1000;
-    if ([g_fileManager fileExistsAtPath:g_tempFile]) showRotateButton();
     %orig;
 }
-- (void)stopRunning { g_cameraRunning = NO; hideRotateButton(); %orig; }
+- (void)stopRunning { g_cameraRunning = NO; %orig; }
 - (void)addInput:(AVCaptureDeviceInput *)input {
     if ([[input device] position] > 0) g_cameraPosition = [[input device] position] == 1 ? @"B" : @"F";
     %orig;
@@ -570,7 +371,7 @@ CALayer *g_maskLayer = nil;
 }
 %end
 
-// ===== 音频 Hook =====
+// 音频 Hook
 static OSStatus (*AudioUnitRender_orig)(AudioUnit, AudioUnitRenderActionFlags *, const AudioTimeStamp *, UInt32, UInt32, AudioBufferList *) = NULL;
 static OSStatus AudioUnitRender_hook(AudioUnit inUnit, AudioUnitRenderActionFlags *ioActionFlags, const AudioTimeStamp *inTimeStamp, UInt32 inOutputBusNumber, UInt32 inNumberFrames, AudioBufferList *ioData) {
     OSStatus status = AudioUnitRender_orig(inUnit, ioActionFlags, inTimeStamp, inOutputBusNumber, inNumberFrames, ioData);
@@ -602,13 +403,11 @@ static OSStatus AudioUnitRender_hook(AudioUnit inUnit, AudioUnitRenderActionFlag
     return status;
 }
 
-// ===== 初始化 =====
 %ctor {
     g_isMirroredMark = [NSString stringWithUTF8String:jbroot("/var/mobile/Library/Caches/vcam_is_mirrored_mark")];
     g_tempFile = [NSString stringWithUTF8String:jbroot("/var/mobile/Library/Caches/temp.mov")];
     if ([[NSProcessInfo processInfo] isOperatingSystemAtLeastVersion:(NSOperatingSystemVersion){15, 0, 0}]) g_isIOS15OrLater = YES;
-    g_fileManager = [NSFileManager defaultManager]; loadUserRotation();
-    g_ciQueue = dispatch_queue_create("vcam.ci", DISPATCH_QUEUE_SERIAL); g_ciContext = [CIContext contextWithOptions:nil];
+    g_fileManager = [NSFileManager defaultManager];
     updatePreferences();
     CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), NULL, prefsChanged, CFSTR("com.trizau.sileo.vcam.prefschanged"), NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
     MSHookFunction((void *)AudioUnitRender, (void *)AudioUnitRender_hook, (void **)&AudioUnitRender_orig);
@@ -616,8 +415,6 @@ static OSStatus AudioUnitRender_hook(AudioUnit inUnit, AudioUnitRenderActionFlag
 %dtor {
     g_fileManager = nil; g_canReleaseBuffer = YES; g_bufferReload = YES; g_previewLayer = nil;
     g_refreshPreviewByVideoDataOutputTime = 0; g_cameraRunning = NO;
-    if (g_outputPool) { CVPixelBufferPoolRelease(g_outputPool); g_outputPool = NULL; }
-    g_ciContext = nil; g_ciQueue = nil;
     if (g_audioRingBuffer) { free(g_audioRingBuffer); g_audioRingBuffer = NULL; }
-    g_audioReader = nil; g_audioReplacementOutput = nil; g_audioInjectionReady = NO; g_rotateBtn = nil; g_buttonWindow = nil;
+    g_audioReader = nil; g_audioReplacementOutput = nil; g_audioInjectionReady = NO;
 }
