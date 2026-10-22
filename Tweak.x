@@ -27,9 +27,10 @@ static dispatch_queue_t g_videoQueue = nil;
 static NSString *g_tempFile = nil;
 static NSDictionary *preferences;
 
-static CGSize g_targetSize = CGSizeMake(720, 1280);
+// 修复：使用原生结构体字面量避免编译期常量报错
+static CGSize g_targetSize = {720.0, 1280.0};
 static OSType g_targetFormat = kCVPixelFormatType_420YpCbCr8BiPlanarFullRange;
-static BOOL g_isMirrored = NO; // 记录当前是否是前置镜像
+static BOOL g_isMirrored = NO;
 
 AVPlayer* FindPlayerInView(UIView *view, int depth) {
     if (!view || depth > 20) return nil;
@@ -79,7 +80,6 @@ static void prefsChanged(CFNotificationCenterRef center, void *observer, CFStrin
             return (CMSampleBufferRef)CFRetain(sampleBuffer);
         }
 
-        // 实时更新镜像状态和尺寸格式
         if (originSampleBuffer != nil) {
             CVImageBufferRef originPixelBuffer = CMSampleBufferGetImageBuffer(originSampleBuffer);
             if (originPixelBuffer) {
@@ -131,7 +131,6 @@ static void prefsChanged(CFNotificationCenterRef center, void *observer, CFStrin
 
                 AVMutableVideoCompositionLayerInstruction *layerInstruction = [AVMutableVideoCompositionLayerInstruction videoCompositionLayerInstructionWithAssetTrack:videoTrack];
                 
-                // 计算 AspectFill 居中裁剪
                 CGFloat scale = MAX(g_targetSize.width / sourceSize.width, g_targetSize.height / sourceSize.height);
                 CGAffineTransform scaleTransform = CGAffineTransformMakeScale(scale, scale);
                 CGAffineTransform finalTransform = CGAffineTransformConcat(transform, scaleTransform);
@@ -140,7 +139,6 @@ static void prefsChanged(CFNotificationCenterRef center, void *observer, CFStrin
                 CGFloat dy = (g_targetSize.height - sourceSize.height * scale) / 2.0;
                 finalTransform = CGAffineTransformTranslate(finalTransform, dx / scale, dy / scale);
 
-                // 核心修复：如果原相机（如微信前置）开启了镜像，这里强制加入翻转矩阵
                 if (g_isMirrored) {
                     CGAffineTransform mirrorTransform = CGAffineTransformMakeTranslation(g_targetSize.width, 0);
                     mirrorTransform = CGAffineTransformScale(mirrorTransform, -1.0, 1.0);
@@ -199,7 +197,7 @@ static void prefsChanged(CFNotificationCenterRef center, void *observer, CFStrin
 }
 @end
 
-// ============ 拍照完美替换 (修复照片方向) ============
+// ============ 拍照完美替换 ============
 %hook AVCapturePhoto
 - (NSData *)fileDataRepresentation {
     NSData *vcamData = objc_getAssociatedObject(self, &kVCAMPhotoDataKey);
@@ -233,7 +231,6 @@ static NSMutableSet *g_hookedPhotoClasses = nil;
                                 if (pixelBuffer) {
                                     CIImage *ciImage = [CIImage imageWithCVImageBuffer:pixelBuffer];
                                     
-                                    // 核心修复：根据手机当前方向给 UIImage 赋值正确方向
                                     UIInterfaceOrientation orient = UIInterfaceOrientationPortrait;
                                     if (@available(iOS 13.0, *)) {
                                         orient = [UIApplication sharedApplication].windows.firstObject.windowScene.interfaceOrientation;
@@ -266,7 +263,6 @@ static NSMutableSet *g_hookedPhotoClasses = nil;
 }
 %end
 
-// 兼容旧版
 %hook AVCaptureStillImageOutput
 + (NSData *)jpegStillImageNSDataRepresentation:(CMSampleBufferRef)jpegSampleBuffer {
     CMSampleBufferRef newBuffer = [GetFrame getCurrentFrame:nil :YES :nil];
@@ -364,7 +360,6 @@ CALayer *g_maskLayer = nil;
         MSHookMessageEx([sampleBufferDelegate class], @selector(captureOutput:didOutputSampleBuffer:fromConnection:), imp_implementationWithBlock(^(id self, AVCaptureOutput *output, CMSampleBufferRef sampleBuffer, AVCaptureConnection *connection) {
             @try {
                 if (!sampleBuffer) return;
-                // 核心修复：将 connection 传入 GetFrame，让视频流也具备镜像和方向处理
                 CMSampleBufferRef newBuffer = [GetFrame getCurrentFrame:sampleBuffer :NO :connection];
                 if (newBuffer) {
                     if (g_previewLayer && g_previewLayer.readyForMoreMediaData) {
