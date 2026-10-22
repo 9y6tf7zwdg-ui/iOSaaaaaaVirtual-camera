@@ -99,7 +99,9 @@ static void prefsChanged(CFNotificationCenterRef center, void *observer, CFStrin
         if (g_bufferReload) {
             g_bufferReload = NO;
             @try {
-                AVAsset *asset = [AVAsset assetWithURL:[NSURL URLWithString:[NSString stringWithFormat:@"file://%@", g_tempFile]]];
+                // 修复：使用 fileURLWithPath 防止路径包含特殊字符崩溃
+                NSURL *fileURL = [NSURL fileURLWithPath:g_tempFile];
+                AVAsset *asset = [AVAsset assetWithURL:fileURL];
                 reader = [AVAssetReader assetReaderWithAsset:asset error:nil];
                 AVAssetTrack *videoTrack = [[asset tracksWithMediaType:AVMediaTypeVideo] firstObject];
                 if (!videoTrack) return nil;
@@ -123,16 +125,16 @@ static void prefsChanged(CFNotificationCenterRef center, void *observer, CFStrin
         CMSampleBufferRef newsampleBuffer = nil;
         switch(subMediaType) {
             case kCVPixelFormatType_32BGRA:
-                CMSampleBufferCreateCopy(kCFAllocatorDefault, videoTrackout_32BGRA_Buffer, &newsampleBuffer);
+                if (videoTrackout_32BGRA_Buffer) CMSampleBufferCreateCopy(kCFAllocatorDefault, videoTrackout_32BGRA_Buffer, &newsampleBuffer);
                 break;
             case kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange:
-                CMSampleBufferCreateCopy(kCFAllocatorDefault, videoTrackout_420YpCbCr8BiPlanarVideoRange_Buffer, &newsampleBuffer);
+                if (videoTrackout_420YpCbCr8BiPlanarVideoRange_Buffer) CMSampleBufferCreateCopy(kCFAllocatorDefault, videoTrackout_420YpCbCr8BiPlanarVideoRange_Buffer, &newsampleBuffer);
                 break;
             case kCVPixelFormatType_420YpCbCr8BiPlanarFullRange:
-                CMSampleBufferCreateCopy(kCFAllocatorDefault, videoTrackout_420YpCbCr8BiPlanarFullRange_Buffer, &newsampleBuffer);
+                if (videoTrackout_420YpCbCr8BiPlanarFullRange_Buffer) CMSampleBufferCreateCopy(kCFAllocatorDefault, videoTrackout_420YpCbCr8BiPlanarFullRange_Buffer, &newsampleBuffer);
                 break;
             default:
-                CMSampleBufferCreateCopy(kCFAllocatorDefault, videoTrackout_32BGRA_Buffer, &newsampleBuffer);
+                if (videoTrackout_32BGRA_Buffer) CMSampleBufferCreateCopy(kCFAllocatorDefault, videoTrackout_32BGRA_Buffer, &newsampleBuffer);
         }
 
         if (videoTrackout_32BGRA_Buffer) CFRelease(videoTrackout_32BGRA_Buffer);
@@ -158,7 +160,7 @@ static void prefsChanged(CFNotificationCenterRef center, void *observer, CFStrin
                     CFDictionaryRef exifAttachments = CMGetAttachment(originSampleBuffer, (CFStringRef)@"{Exif}", NULL);
                     CFDictionaryRef TIFFAttachments = CMGetAttachment(originSampleBuffer, (CFStringRef)@"{TIFF}", NULL);
                     if (exifAttachments) CMSetAttachment(copyBuffer, (CFStringRef)@"{Exif}", exifAttachments, kCMAttachmentMode_ShouldPropagate);
-                    if (exifAttachments) CMSetAttachment(copyBuffer, (CFStringRef)@"{TIFF}", TIFFAttachments, kCMAttachmentMode_ShouldPropagate);
+                    if (TIFFAttachments) CMSetAttachment(copyBuffer, (CFStringRef)@"{TIFF}", TIFFAttachments, kCMAttachmentMode_ShouldPropagate);
                     sampleBuffer = copyBuffer;
                 }
                 CFRelease(newsampleBuffer);
