@@ -13,7 +13,6 @@
 #define VCLOG(fmt, ...) do {} while(0)
 #endif
 
-// ============ 全局变量 ============
 static NSFileManager *g_fileManager = nil;
 static BOOL g_canReleaseBuffer = YES;
 static BOOL g_bufferReload = YES;
@@ -22,14 +21,10 @@ static BOOL g_cameraRunning = NO;
 
 static AVAssetReader *reader = nil;
 static AVAssetReaderVideoCompositionOutput *videoCompositionOutput = nil;
-
-// 全局专属后台队列，防止长视频解码卡死主线程
 static dispatch_queue_t g_videoQueue = nil;
 static NSString *g_tempFile = nil;
 static NSDictionary *preferences;
-static CIContext *g_ciContext = nil; // 全局CI上下文
 
-// 使用 C 函数代替 OC 方法查找播放器，避免 Logos 语法报错
 AVPlayer* FindPlayerInView(UIView *view, int depth) {
     if (!view || depth > 20) return nil;
     if ([view.layer isKindOfClass:[AVPlayerLayer class]]) {
@@ -67,7 +62,7 @@ static void prefsChanged(CFNotificationCenterRef center, void *observer, CFStrin
     updatePreferences();
 }
 
-// ============ GetFrame (完美匹配分辨率 & 旋转) ============
+// ============ GetFrame (绝对防崩级尺寸适配) ============
 @interface GetFrame : NSObject
 + (CMSampleBufferRef _Nullable)getCurrentFrame:(CMSampleBufferRef)originSampleBuffer :(BOOL)forceReNew;
 @end
@@ -77,7 +72,7 @@ static void prefsChanged(CFNotificationCenterRef center, void *observer, CFStrin
 + (CMSampleBufferRef _Nullable)getCurrentFrame:(CMSampleBufferRef _Nullable)originSampleBuffer :(BOOL)forceReNew {
     @synchronized (self) {
         static CMSampleBufferRef sampleBuffer = nil;
-
+        
         if ([g_fileManager fileExistsAtPath:g_tempFile] == NO) return nil;
         
         if (sampleBuffer != nil && !g_canReleaseBuffer && CMSampleBufferIsValid(sampleBuffer) && forceReNew != YES) {
@@ -104,28 +99,51 @@ static void prefsChanged(CFNotificationCenterRef center, void *observer, CFStrin
                 AVAssetTrack *videoTrack = [[asset tracksWithMediaType:AVMediaTypeVideo] firstObject];
                 if (!videoTrack) return nil;
 
+                // 获取原生相机的真实尺寸和格式（防崩核心）
+                CGSize targetSize = CGSizeMake(720, 1280); // 默认
+                OSType targetFormat = kCVPixelFormatType_420YpCbCr8BiPlanarFullRange; 
+
+                if (originSampleBuffer != nil) {
+                    CVImageBufferRef originPixelBuffer = CMSampleBufferGetImageBuffer(originSampleBuffer);
+                    if (originPixelBuffer) {
+                        targetSize = CGSizeMake(CVPixelBufferGetWidth(originPixelBuffer), CVPixelBufferGetHeight(originPixelBuffer));
+                    }
+                    CMFormatDescriptionRef formatDesc = CMSampleBufferGetFormatDescription(originSampleBuffer);
+                    if (formatDesc) {
+                        targetFormat = CMFormatDescriptionGetMediaSubType(formatDesc);
+                    }
+                }
+
                 CGAffineTransform transform = videoTrack.preferredTransform;
-                CGSize renderSize = videoTrack.naturalSize;
+                CGSize sourceSize = videoTrack.naturalSize;
                 if (transform.a == 0 && transform.b == 1.0 && transform.c == -1.0 && transform.d == 0) {
-                    renderSize = CGSizeMake(videoTrack.naturalSize.height, videoTrack.naturalSize.width);
+                    sourceSize = CGSizeMake(videoTrack.naturalSize.height, videoTrack.naturalSize.width);
                 } else if (transform.a == 0 && transform.b == -1.0 && transform.c == 1.0 && transform.d == 0) {
-                    renderSize = CGSizeMake(videoTrack.naturalSize.height, videoTrack.naturalSize.width);
+                    sourceSize = CGSizeMake(videoTrack.naturalSize.height, videoTrack.naturalSize.width);
                 }
 
                 AVMutableVideoComposition *videoComposition = [AVMutableVideoComposition videoComposition];
-                videoComposition.renderSize = renderSize;
+                videoComposition.renderSize = targetSize; 
                 videoComposition.frameDuration = CMTimeMake(1, 30);
 
                 AVMutableVideoCompositionInstruction *instruction = [AVMutableVideoCompositionInstruction videoCompositionInstruction];
                 instruction.timeRange = CMTimeRangeMake(kCMTimeZero, asset.duration);
 
                 AVMutableVideoCompositionLayerInstruction *layerInstruction = [AVMutableVideoCompositionLayerInstruction videoCompositionLayerInstructionWithAssetTrack:videoTrack];
-                [layerInstruction setTransform:transform atTime:kCMTimeZero];
+                
+                CGFloat scale = MAX(targetSize.width / sourceSize.width, targetSize.height / sourceSize.height);
+                CGAffineTransform scaleTransform = CGAffineTransformMakeScale(scale, scale);
+                CGAffineTransform finalTransform = CGAffineTransformConcat(transform, scaleTransform);
+                
+                CGFloat dx = (targetSize.width - sourceSize.width * scale) / 2.0;
+                CGFloat dy = (targetSize.height - sourceSize.height * scale) / 2.0;
+                finalTransform = CGAffineTransformTranslate(finalTransform, dx / scale, dy / scale);
+
+                [layerInstruction setTransform:finalTransform atTime:kCMTimeZero];
                 instruction.layerInstructions = @[layerInstruction];
                 videoComposition.instructions = @[instruction];
 
-                OSType pixelFormat = kCVPixelFormatType_32BGRA;
-                videoCompositionOutput = [[AVAssetReaderVideoCompositionOutput alloc] initWithVideoTracks:@[videoTrack] videoSettings:@{(id)kCVPixelBufferPixelFormatTypeKey: @(pixelFormat)}];
+                videoCompositionOutput = [[AVAssetReaderVideoCompositionOutput alloc] initWithVideoTracks:@[videoTrack] videoSettings:@{(id)kCVPixelBufferPixelFormatTypeKey: @(targetFormat)}];
                 videoCompositionOutput.videoComposition = videoComposition;
                 [reader addOutput:videoCompositionOutput];
                 [reader startReading];
@@ -143,51 +161,9 @@ static void prefsChanged(CFNotificationCenterRef center, void *observer, CFStrin
             if (sampleBuffer) CFRelease(sampleBuffer);
             
             if (originSampleBuffer != nil) {
-                CVImageBufferRef originPixelBuffer = CMSampleBufferGetImageBuffer(originSampleBuffer);
+                CMSampleBufferRef copyBuffer = NULL;
                 CVImageBufferRef newPixelBuffer = CMSampleBufferGetImageBuffer(newBuffer);
-                
-                size_t targetW = CVPixelBufferGetWidth(originPixelBuffer);
-                size_t targetH = CVPixelBufferGetHeight(originPixelBuffer);
-                size_t sourceW = CVPixelBufferGetWidth(newPixelBuffer);
-                size_t sourceH = CVPixelBufferGetHeight(newPixelBuffer);
-                
-                CMSampleBufferRef finalSampleBuffer = NULL;
-                
-                if (targetW != sourceW || targetH != sourceH) {
-                    if (!g_ciContext) {
-                        g_ciContext = [CIContext contextWithOptions:@{kCIContextUseSoftwareRenderer: @NO}];
-                    }
-                    CIImage *ciImage = [CIImage imageWithCVPixelBuffer:newPixelBuffer];
-                    
-                    CGFloat scale = MAX((CGFloat)targetW / sourceW, (CGFloat)targetH / sourceH);
-                    CGAffineTransform scaleTransform = CGAffineTransformMakeScale(scale, scale);
-                    CIImage *scaledImage = [ciImage imageByApplyingTransform:scaleTransform];
-                    
-                    CGRect cropRect = CGRectMake((scaledImage.extent.size.width - targetW) / 2.0,
-                                                 (scaledImage.extent.size.height - targetH) / 2.0,
-                                                 targetW, targetH);
-                    CIImage *croppedImage = [scaledImage imageByCroppingToRect:cropRect];
-                    
-                    CVPixelBufferRef finalPixelBuffer = NULL;
-                    NSDictionary *options = @{(id)kCVPixelBufferIOSurfacePropertiesKey: @{}};
-                    CVPixelBufferCreate(kCFAllocatorDefault, targetW, targetH, kCVPixelFormatType_32BGRA, (__bridge CFDictionaryRef)options, &finalPixelBuffer);
-                    
-                    [g_ciContext render:croppedImage toCVPixelBuffer:finalPixelBuffer];
-                    
-                    CMSampleTimingInfo sampleTime = {
-                        .duration = CMSampleBufferGetDuration(originSampleBuffer),
-                        .presentationTimeStamp = CMSampleBufferGetPresentationTimeStamp(originSampleBuffer),
-                        .decodeTimeStamp = CMSampleBufferGetDecodeTimeStamp(originSampleBuffer)
-                    };
-                    CMVideoFormatDescriptionRef videoInfo = nil;
-                    CMVideoFormatDescriptionCreateForImageBuffer(kCFAllocatorDefault, finalPixelBuffer, &videoInfo);
-                    CMSampleBufferCreateForImageBuffer(kCFAllocatorDefault, finalPixelBuffer, true, nil, nil, videoInfo, &sampleTime, &finalSampleBuffer);
-                    
-                    CFRelease(finalPixelBuffer);
-                    CFRelease(videoInfo);
-                    CFRelease(newBuffer);
-                } else {
-                    CMSampleBufferRef copyBuffer = nil;
+                if (newPixelBuffer) {
                     CMSampleTimingInfo sampleTime = {
                         .duration = CMSampleBufferGetDuration(originSampleBuffer),
                         .presentationTimeStamp = CMSampleBufferGetPresentationTimeStamp(originSampleBuffer),
@@ -196,14 +172,13 @@ static void prefsChanged(CFNotificationCenterRef center, void *observer, CFStrin
                     CMVideoFormatDescriptionRef videoInfo = nil;
                     CMVideoFormatDescriptionCreateForImageBuffer(kCFAllocatorDefault, newPixelBuffer, &videoInfo);
                     CMSampleBufferCreateForImageBuffer(kCFAllocatorDefault, newPixelBuffer, true, nil, nil, videoInfo, &sampleTime, &copyBuffer);
-                    finalSampleBuffer = copyBuffer;
                     CFRelease(videoInfo);
-                    CFRelease(newBuffer);
                 }
+                CFRelease(newBuffer);
                 
-                if (finalSampleBuffer) {
-                    sampleBuffer = (CMSampleBufferRef)CFRetain(finalSampleBuffer);
-                    CFRelease(finalSampleBuffer);
+                if (copyBuffer) {
+                    sampleBuffer = (CMSampleBufferRef)CFRetain(copyBuffer);
+                    CFRelease(copyBuffer);
                 }
             } else {
                 sampleBuffer = (CMSampleBufferRef)CFRetain(newBuffer);
@@ -216,7 +191,7 @@ static void prefsChanged(CFNotificationCenterRef center, void *observer, CFStrin
 }
 @end
 
-// ============ 视频预览 Hook ============
+// ============ 视频预览与主逻辑 ============
 CALayer *g_maskLayer = nil;
 
 %hook AVCaptureVideoPreviewLayer
@@ -293,14 +268,17 @@ CALayer *g_maskLayer = nil;
         __block void (*original_method)(id, SEL, AVCaptureOutput *, CMSampleBufferRef, AVCaptureConnection *) = nil;
         MSHookMessageEx([sampleBufferDelegate class], @selector(captureOutput:didOutputSampleBuffer:fromConnection:), imp_implementationWithBlock(^(id self, AVCaptureOutput *output, CMSampleBufferRef sampleBuffer, AVCaptureConnection *connection) {
             @try {
+                if (!sampleBuffer) return;
                 CMSampleBufferRef newBuffer = [GetFrame getCurrentFrame:sampleBuffer :NO];
-                if (newBuffer && g_previewLayer && g_previewLayer.readyForMoreMediaData) {
-                    [g_previewLayer flush];
-                    [g_previewLayer enqueueSampleBuffer:newBuffer];
-                }
-                original_method(self, @selector(captureOutput:didOutputSampleBuffer:fromConnection:), output, newBuffer ?: sampleBuffer, connection);
-                if (newBuffer && newBuffer != sampleBuffer) {
+                if (newBuffer) {
+                    if (g_previewLayer && g_previewLayer.readyForMoreMediaData) {
+                        [g_previewLayer flush];
+                        [g_previewLayer enqueueSampleBuffer:newBuffer];
+                    }
+                    original_method(self, @selector(captureOutput:didOutputSampleBuffer:fromConnection:), output, newBuffer, connection);
                     CFRelease(newBuffer);
+                } else {
+                    original_method(self, @selector(captureOutput:didOutputSampleBuffer:fromConnection:), output, sampleBuffer, connection);
                 }
             } @catch (NSException *e) {
                 original_method(self, @selector(captureOutput:didOutputSampleBuffer:fromConnection:), output, sampleBuffer, connection);
@@ -365,7 +343,6 @@ static NSTimer *g_timeTimer = nil;
         }
         [g_timeTimer invalidate];
         g_timeTimer = [NSTimer scheduledTimerWithTimeInterval:0.1 repeats:YES block:^(NSTimer * _Nonnull timer) {
-            // 这里改用全局 C 函数查找播放器
             AVPlayer *player = FindPlayerInView(self.view, 0);
             if (player && g_timeLabel) {
                 float curSec = CMTimeGetSeconds(player.currentTime);
