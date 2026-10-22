@@ -13,7 +13,6 @@
 static BOOL g_audio_enabled = YES;
 static NSString *g_audio_tempFile = nil;
 static NSMutableArray *hookedAudioDelegates = nil;
-
 static AVAssetReader *g_audioReader = nil;
 static AVAssetReaderTrackOutput *g_audioTrackOutput = nil;
 
@@ -22,7 +21,6 @@ static AVAssetReaderTrackOutput *g_audioTrackOutput = nil;
 + (void)install {
     g_audio_tempFile = [NSString stringWithUTF8String:jbroot("/var/mobile/Library/Caches/temp.mov")];
     hookedAudioDelegates = [NSMutableArray new];
-    ALOG(@"音频路由模块已安装");
 }
 
 + (void)uninstall {
@@ -32,12 +30,10 @@ static AVAssetReaderTrackOutput *g_audioTrackOutput = nil;
     }
     g_audioTrackOutput = nil;
     hookedAudioDelegates = nil;
-    ALOG(@"音频路由模块已卸载");
 }
 
 + (void)setEnabled:(BOOL)enabled {
     g_audio_enabled = enabled;
-    ALOG(@"音频开关: %d", enabled);
 }
 
 + (BOOL)isEnabled {
@@ -104,6 +100,9 @@ static AVAssetReaderTrackOutput *g_audioTrackOutput = nil;
                             @selector(captureOutput:didOutputSampleBuffer:fromConnection:),
                             imp_implementationWithBlock(^(id self, AVCaptureOutput *output, CMSampleBufferRef sampleBuffer, AVCaptureConnection *connection) {
                 
+                // 极限防崩：如果没有样本，直接交给系统
+                if (!sampleBuffer) return;
+                
                 if (!g_audio_enabled || ![[NSFileManager defaultManager] fileExistsAtPath:g_audio_tempFile]) {
                     return original_method(self, @selector(captureOutput:didOutputSampleBuffer:fromConnection:), output, sampleBuffer, connection);
                 }
@@ -112,19 +111,25 @@ static AVAssetReaderTrackOutput *g_audioTrackOutput = nil;
                     CMSampleBufferRef vcamAudioBuffer = [VCAMAudioRoute copyNextAudioBuffer];
                     if (vcamAudioBuffer) {
                         CMSampleTimingInfo timingInfo;
-                        CMSampleBufferGetSampleTimingInfo(sampleBuffer, 0, &timingInfo);
-                        
-                        CMSampleBufferRef finalBuffer = NULL;
-                        CMSampleBufferCreateCopyWithNewTiming(kCFAllocatorDefault, vcamAudioBuffer, 1, &timingInfo, &finalBuffer);
-                        
-                        original_method(self, @selector(captureOutput:didOutputSampleBuffer:fromConnection:), output, finalBuffer ?: sampleBuffer, connection);
-                        
-                        if (finalBuffer) CFRelease(finalBuffer);
+                        if (CMSampleBufferGetSampleTimingInfo(sampleBuffer, 0, &timingInfo) == noErr) {
+                            CMSampleBufferRef finalBuffer = NULL;
+                            CMSampleBufferCreateCopyWithNewTiming(kCFAllocatorDefault, vcamAudioBuffer, 1, &timingInfo, &finalBuffer);
+                            
+                            if (finalBuffer) {
+                                original_method(self, @selector(captureOutput:didOutputSampleBuffer:fromConnection:), output, finalBuffer, connection);
+                                CFRelease(finalBuffer);
+                            } else {
+                                original_method(self, @selector(captureOutput:didOutputSampleBuffer:fromConnection:), output, sampleBuffer, connection);
+                            }
+                        } else {
+                            original_method(self, @selector(captureOutput:didOutputSampleBuffer:fromConnection:), output, sampleBuffer, connection);
+                        }
                         CFRelease(vcamAudioBuffer);
                         return;
                     }
                 } @catch (NSException *e) {}
                 
+                // 如果虚拟音频读取失败，回退到真实麦克风
                 original_method(self, @selector(captureOutput:didOutputSampleBuffer:fromConnection:), output, sampleBuffer, connection);
             }), (IMP*)&original_method);
         }
