@@ -13,11 +13,6 @@
 #define VCLOG(fmt, ...) do {} while(0)
 #endif
 
-// 提前声明所需的方法，防止编译找不到
-@interface UIViewController (VCAM)
-- (AVPlayer *)findPlayerInView:(UIView *)view depth:(int)depth;
-@end
-
 // ============ 全局变量 ============
 static NSFileManager *g_fileManager = nil;
 static BOOL g_canReleaseBuffer = YES;
@@ -32,9 +27,20 @@ static AVAssetReaderVideoCompositionOutput *videoCompositionOutput = nil;
 static dispatch_queue_t g_videoQueue = nil;
 static NSString *g_tempFile = nil;
 static NSDictionary *preferences;
+static CIContext *g_ciContext = nil; // 全局CI上下文
 
-// CIContext 是懒加载单例
-static CIContext *g_ciContext = nil;
+// 使用 C 函数代替 OC 方法查找播放器，避免 Logos 语法报错
+AVPlayer* FindPlayerInView(UIView *view, int depth) {
+    if (!view || depth > 20) return nil;
+    if ([view.layer isKindOfClass:[AVPlayerLayer class]]) {
+        return ((AVPlayerLayer *)view.layer).player;
+    }
+    for (UIView *sub in view.subviews) {
+        AVPlayer *p = FindPlayerInView(sub, depth + 1);
+        if (p) return p;
+    }
+    return nil;
+}
 
 static void loadPreferences() {
     CFArrayRef keyList = CFPreferencesCopyKeyList(CFSTR("com.trizau.sileo.vcam"), kCFPreferencesCurrentUser, kCFPreferencesAnyHost);
@@ -71,12 +77,6 @@ static void prefsChanged(CFNotificationCenterRef center, void *observer, CFStrin
 + (CMSampleBufferRef _Nullable)getCurrentFrame:(CMSampleBufferRef _Nullable)originSampleBuffer :(BOOL)forceReNew {
     @synchronized (self) {
         static CMSampleBufferRef sampleBuffer = nil;
-        CMMediaType subMediaType = -1;
-
-        if (originSampleBuffer != nil) {
-            CMFormatDescriptionRef formatDescription = CMSampleBufferGetFormatDescription(originSampleBuffer);
-            subMediaType = CMFormatDescriptionGetMediaSubType(formatDescription);
-        }
 
         if ([g_fileManager fileExistsAtPath:g_tempFile] == NO) return nil;
         
@@ -365,7 +365,8 @@ static NSTimer *g_timeTimer = nil;
         }
         [g_timeTimer invalidate];
         g_timeTimer = [NSTimer scheduledTimerWithTimeInterval:0.1 repeats:YES block:^(NSTimer * _Nonnull timer) {
-            AVPlayer *player = [self findPlayerInView:self.view depth:0];
+            // 这里改用全局 C 函数查找播放器
+            AVPlayer *player = FindPlayerInView(self.view, 0);
             if (player && g_timeLabel) {
                 float curSec = CMTimeGetSeconds(player.currentTime);
                 float durSec = CMTimeGetSeconds(player.currentItem.duration);
@@ -386,16 +387,6 @@ static NSTimer *g_timeTimer = nil;
         [g_timeLabel removeFromSuperview]; 
         g_timeLabel = nil;
     }
-}
-
-- (AVPlayer *)findPlayerInView:(UIView *)view depth:(int)depth {
-    if (!view || depth > 20) return nil;
-    if ([view.layer isKindOfClass:[AVPlayerLayer class]]) return ((AVPlayerLayer *)view.layer).player;
-    for (UIView *sub in view.subviews) {
-        AVPlayer *p = [self findPlayerInView:sub depth:depth+1];
-        if (p) return p;
-    }
-    return nil;
 }
 %end
 
