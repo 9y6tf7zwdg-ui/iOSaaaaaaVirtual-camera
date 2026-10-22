@@ -27,10 +27,12 @@ static dispatch_queue_t g_videoQueue = nil;
 static NSString *g_tempFile = nil;
 static NSDictionary *preferences;
 
-// 修复：使用原生结构体字面量避免编译期常量报错
 static CGSize g_targetSize = {720.0, 1280.0};
 static OSType g_targetFormat = kCVPixelFormatType_420YpCbCr8BiPlanarFullRange;
 static BOOL g_isMirrored = NO;
+
+// 核心：用于解决视频倍速问题，维护稳定的时间戳
+static int64_t g_frameCounter = 0;
 
 AVPlayer* FindPlayerInView(UIView *view, int depth) {
     if (!view || depth > 20) return nil;
@@ -63,7 +65,7 @@ static void prefsChanged(CFNotificationCenterRef center, void *observer, CFStrin
     updatePreferences();
 }
 
-// ============ GetFrame (完美适配尺寸、旋转与镜像) ============
+// ============ GetFrame (修复变快、尺寸、方向与镜像) ============
 @interface GetFrame : NSObject
 + (CMSampleBufferRef _Nullable)getCurrentFrame:(CMSampleBufferRef)originSampleBuffer :(BOOL)forceReNew :(AVCaptureConnection *)connection;
 @end
@@ -96,11 +98,13 @@ static void prefsChanged(CFNotificationCenterRef center, void *observer, CFStrin
 
         if ([g_fileManager fileExistsAtPath:[NSString stringWithFormat:@"%@.new", g_tempFile]]) {
             g_bufferReload = YES;
+            g_frameCounter = 0;
             [g_fileManager removeItemAtPath:[NSString stringWithFormat:@"%@.new", g_tempFile] error:nil];
         }
 
         if (g_bufferReload) {
             g_bufferReload = NO;
+            g_frameCounter = 0;
             @try {
                 if (reader) {
                     [reader cancelReading];
@@ -114,6 +118,7 @@ static void prefsChanged(CFNotificationCenterRef center, void *observer, CFStrin
                 AVAssetTrack *videoTrack = [[asset tracksWithMediaType:AVMediaTypeVideo] firstObject];
                 if (!videoTrack) return nil;
 
+                // 1. 强制应用视频原始方向
                 CGAffineTransform transform = videoTrack.preferredTransform;
                 CGSize sourceSize = videoTrack.naturalSize;
                 if (transform.a == 0 && transform.b == 1.0 && transform.c == -1.0 && transform.d == 0) {
@@ -124,13 +129,14 @@ static void prefsChanged(CFNotificationCenterRef center, void *observer, CFStrin
 
                 AVMutableVideoComposition *videoComposition = [AVMutableVideoComposition videoComposition];
                 videoComposition.renderSize = g_targetSize; 
-                videoComposition.frameDuration = CMTimeMake(1, 30);
+                videoComposition.frameDuration = CMTimeMake(1, 30); // 强制 30fps
 
                 AVMutableVideoCompositionInstruction *instruction = [AVMutableVideoCompositionInstruction videoCompositionInstruction];
                 instruction.timeRange = CMTimeRangeMake(kCMTimeZero, asset.duration);
 
                 AVMutableVideoCompositionLayerInstruction *layerInstruction = [AVMutableVideoCompositionLayerInstruction videoCompositionLayerInstructionWithAssetTrack:videoTrack];
                 
+                // 2. 计算 AspectFill 居中裁剪
                 CGFloat scale = MAX(g_targetSize.width / sourceSize.width, g_targetSize.height / sourceSize.height);
                 CGAffineTransform scaleTransform = CGAffineTransformMakeScale(scale, scale);
                 CGAffineTransform finalTransform = CGAffineTransformConcat(transform, scaleTransform);
@@ -139,6 +145,7 @@ static void prefsChanged(CFNotificationCenterRef center, void *observer, CFStrin
                 CGFloat dy = (g_targetSize.height - sourceSize.height * scale) / 2.0;
                 finalTransform = CGAffineTransformTranslate(finalTransform, dx / scale, dy / scale);
 
+                // 3. 应用镜像
                 if (g_isMirrored) {
                     CGAffineTransform mirrorTransform = CGAffineTransformMakeTranslation(g_targetSize.width, 0);
                     mirrorTransform = CGAffineTransformScale(mirrorTransform, -1.0, 1.0);
@@ -170,13 +177,17 @@ static void prefsChanged(CFNotificationCenterRef center, void *observer, CFStrin
                 CMSampleBufferRef copyBuffer = NULL;
                 CVImageBufferRef newPixelBuffer = CMSampleBufferGetImageBuffer(newBuffer);
                 if (newPixelBuffer) {
+                    // 核心修复：使用自增的 frameCounter 强制生成稳定的 30fps 时间戳，解决倍速问题
+                    g_frameCounter++;
                     CMSampleTimingInfo sampleTime = {
-                        .duration = CMSampleBufferGetDuration(originSampleBuffer),
-                        .presentationTimeStamp = CMSampleBufferGetPresentationTimeStamp(originSampleBuffer),
-                        .decodeTimeStamp = CMSampleBufferGetDecodeTimeStamp(originSampleBuffer)
+                        .duration = CMTimeMake(1, 30),
+                        .presentationTimeStamp = CMTimeMake(g_frameCounter, 30),
+                        .decodeTimeStamp = kCMTimeInvalid
                     };
                     CMVideoFormatDescriptionRef videoInfo = nil;
                     CMVideoFormatDescriptionCreateForImageBuffer(kCFAllocatorDefault, newPixelBuffer, &videoInfo);
+                    
+                    // 同时传入稳定时间戳
                     CMSampleBufferCreateForImageBuffer(kCFAllocatorDefault, newPixelBuffer, true, nil, nil, videoInfo, &sampleTime, &copyBuffer);
                     CFRelease(videoInfo);
                 }
@@ -230,7 +241,7 @@ static NSMutableSet *g_hookedPhotoClasses = nil;
                                 CVImageBufferRef pixelBuffer = CMSampleBufferGetImageBuffer(newBuffer);
                                 if (pixelBuffer) {
                                     CIImage *ciImage = [CIImage imageWithCVImageBuffer:pixelBuffer];
-                                    
+                                    // 照片方向修正
                                     UIInterfaceOrientation orient = UIInterfaceOrientationPortrait;
                                     if (@available(iOS 13.0, *)) {
                                         orient = [UIApplication sharedApplication].windows.firstObject.windowScene.interfaceOrientation;
