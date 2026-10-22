@@ -1,10 +1,19 @@
 #import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
 #import <AVFoundation/AVFoundation.h>
+#import <CoreImage/CoreImage.h>
 #include <roothide.h>
 #import <substrate.h>
 #import "VCAMAudioRoute.h"
 
+#define VCAM_LOG 1
+#if VCAM_LOG
+#define VCLOG(fmt, ...) NSLog(@"[VCAM] " fmt, ##__VA_ARGS__)
+#else
+#define VCLOG(fmt, ...) do {} while(0)
+#endif
+
+// ============ 全局变量 ============
 static NSFileManager *g_fileManager = nil;
 static BOOL g_canReleaseBuffer = YES;
 static BOOL g_bufferReload = YES;
@@ -44,7 +53,7 @@ static void prefsChanged(CFNotificationCenterRef center, void *observer, CFStrin
     updatePreferences();
 }
 
-// ============ GetFrame (修复内存泄漏 & 旋转) ============
+// ============ GetFrame (完美匹配分辨率 & 旋转) ============
 @interface GetFrame : NSObject
 + (CMSampleBufferRef _Nullable)getCurrentFrame:(CMSampleBufferRef)originSampleBuffer :(BOOL)forceReNew;
 @end
@@ -64,11 +73,9 @@ static void prefsChanged(CFNotificationCenterRef center, void *observer, CFStrin
         if ([g_fileManager fileExistsAtPath:g_tempFile] == NO) return nil;
         
         if (sampleBuffer != nil && !g_canReleaseBuffer && CMSampleBufferIsValid(sampleBuffer) && forceReNew != YES) {
-            // 缓存返回，调用方负责释放
             return (CMSampleBufferRef)CFRetain(sampleBuffer);
         }
 
-        // 检测热替换
         if ([g_fileManager fileExistsAtPath:[NSString stringWithFormat:@"%@.new", g_tempFile]]) {
             g_bufferReload = YES;
             [g_fileManager removeItemAtPath:[NSString stringWithFormat:@"%@.new", g_tempFile] error:nil];
@@ -107,9 +114,6 @@ static void prefsChanged(CFNotificationCenterRef center, void *observer, CFStrin
                 videoComposition.instructions = @[instruction];
 
                 OSType pixelFormat = kCVPixelFormatType_32BGRA;
-                if (subMediaType == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange) pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
-                else if (subMediaType == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange) pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarFullRange;
-
                 videoCompositionOutput = [[AVAssetReaderVideoCompositionOutput alloc] initWithVideoTracks:@[videoTrack] videoSettings:@{(id)kCVPixelBufferPixelFormatTypeKey: @(pixelFormat)}];
                 videoCompositionOutput.videoComposition = videoComposition;
                 [reader addOutput:videoCompositionOutput];
@@ -123,38 +127,83 @@ static void prefsChanged(CFNotificationCenterRef center, void *observer, CFStrin
         }
 
         if (newBuffer == nil) {
-            g_bufferReload = YES; // 播完了，下一帧重新加载
+            g_bufferReload = YES;
         } else {
             if (sampleBuffer) CFRelease(sampleBuffer);
+            
             if (originSampleBuffer != nil) {
-                CMSampleBufferRef copyBuffer = nil;
-                CVImageBufferRef pixelBuffer = CMSampleBufferGetImageBuffer(newBuffer);
-                CMSampleTimingInfo sampleTime = {
-                    .duration = CMSampleBufferGetDuration(originSampleBuffer),
-                    .presentationTimeStamp = CMSampleBufferGetPresentationTimeStamp(originSampleBuffer),
-                    .decodeTimeStamp = CMSampleBufferGetDecodeTimeStamp(originSampleBuffer)
-                };
-                CMVideoFormatDescriptionRef videoInfo = nil;
-                CMVideoFormatDescriptionCreateForImageBuffer(kCFAllocatorDefault, pixelBuffer, &videoInfo);
-                CMSampleBufferCreateForImageBuffer(kCFAllocatorDefault, pixelBuffer, true, nil, nil, videoInfo, &sampleTime, &copyBuffer);
-                if (copyBuffer) {
-                    sampleBuffer = (CMSampleBufferRef)CFRetain(copyBuffer);
-                    CFRelease(copyBuffer);
+                CVImageBufferRef originPixelBuffer = CMSampleBufferGetImageBuffer(originSampleBuffer);
+                CVImageBufferRef newPixelBuffer = CMSampleBufferGetImageBuffer(newBuffer);
+                
+                size_t targetW = CVPixelBufferGetWidth(originPixelBuffer);
+                size_t targetH = CVPixelBufferGetHeight(originPixelBuffer);
+                size_t sourceW = CVPixelBufferGetWidth(newPixelBuffer);
+                size_t sourceH = CVPixelBufferGetHeight(newPixelBuffer);
+                
+                CMSampleBufferRef finalSampleBuffer = NULL;
+                
+                if (targetW != sourceW || targetH != sourceH) {
+                    static CIContext *ciContext = [CIContext contextWithOptions:@{kCIContextUseSoftwareRenderer: @NO}];
+                    CIImage *ciImage = [CIImage imageWithCVPixelBuffer:newPixelBuffer];
+                    
+                    CGFloat scale = MAX((CGFloat)targetW / sourceW, (CGFloat)targetH / sourceH);
+                    CGAffineTransform scaleTransform = CGAffineTransformMakeScale(scale, scale);
+                    CIImage *scaledImage = [ciImage imageByApplyingTransform:scaleTransform];
+                    
+                    CGRect cropRect = CGRectMake((scaledImage.extent.size.width - targetW) / 2.0,
+                                                 (scaledImage.extent.size.height - targetH) / 2.0,
+                                                 targetW, targetH);
+                    CIImage *croppedImage = [scaledImage imageByCroppingToRect:cropRect];
+                    
+                    CVPixelBufferRef finalPixelBuffer = NULL;
+                    NSDictionary *options = @{(id)kCVPixelBufferIOSurfacePropertiesKey: @{}};
+                    CVPixelBufferCreate(kCFAllocatorDefault, targetW, targetH, kCVPixelFormatType_32BGRA, (__bridge CFDictionaryRef)options, &finalPixelBuffer);
+                    
+                    [ciContext render:croppedImage toCVPixelBuffer:finalPixelBuffer];
+                    
+                    CMSampleTimingInfo sampleTime = {
+                        .duration = CMSampleBufferGetDuration(originSampleBuffer),
+                        .presentationTimeStamp = CMSampleBufferGetPresentationTimeStamp(originSampleBuffer),
+                        .decodeTimeStamp = CMSampleBufferGetDecodeTimeStamp(originSampleBuffer)
+                    };
+                    CMVideoFormatDescriptionRef videoInfo = nil;
+                    CMVideoFormatDescriptionCreateForImageBuffer(kCFAllocatorDefault, finalPixelBuffer, &videoInfo);
+                    CMSampleBufferCreateForImageBuffer(kCFAllocatorDefault, finalPixelBuffer, true, nil, nil, videoInfo, &sampleTime, &finalSampleBuffer);
+                    
+                    CFRelease(finalPixelBuffer);
+                    CFRelease(videoInfo);
+                    CFRelease(newBuffer);
+                } else {
+                    CMSampleBufferRef copyBuffer = nil;
+                    CMSampleTimingInfo sampleTime = {
+                        .duration = CMSampleBufferGetDuration(originSampleBuffer),
+                        .presentationTimeStamp = CMSampleBufferGetPresentationTimeStamp(originSampleBuffer),
+                        .decodeTimeStamp = CMSampleBufferGetDecodeTimeStamp(originSampleBuffer)
+                    };
+                    CMVideoFormatDescriptionRef videoInfo = nil;
+                    CMVideoFormatDescriptionCreateForImageBuffer(kCFAllocatorDefault, newPixelBuffer, &videoInfo);
+                    CMSampleBufferCreateForImageBuffer(kCFAllocatorDefault, newPixelBuffer, true, nil, nil, videoInfo, &sampleTime, &copyBuffer);
+                    finalSampleBuffer = copyBuffer;
+                    CFRelease(videoInfo);
+                    CFRelease(newBuffer);
                 }
-                CFRelease(newBuffer);
+                
+                if (finalSampleBuffer) {
+                    sampleBuffer = (CMSampleBufferRef)CFRetain(finalSampleBuffer);
+                    CFRelease(finalSampleBuffer);
+                }
             } else {
                 sampleBuffer = (CMSampleBufferRef)CFRetain(newBuffer);
                 CFRelease(newBuffer);
             }
         }
         
-        // 返回 +1 的 buffer 给调用方
         return sampleBuffer ? (CMSampleBufferRef)CFRetain(sampleBuffer) : nil;
     }
 }
 @end
 
-// ============ 预览与视频 Hook ============
+// ============ 视频预览 Hook ============
 CALayer *g_maskLayer = nil;
 
 %hook AVCaptureVideoPreviewLayer
@@ -193,13 +242,12 @@ CALayer *g_maskLayer = nil;
         g_previewLayer.frame = self.bounds;
         g_previewLayer.transform = CATransform3DIdentity;
         
-        // 异步读取，不卡主线程
         dispatch_async(g_videoQueue, ^{
             CMSampleBufferRef newBuffer = [GetFrame getCurrentFrame:nil :NO];
             if (newBuffer) {
-                if (self->g_previewLayer.readyForMoreMediaData) {
-                    [self->g_previewLayer flush];
-                    [self->g_previewLayer enqueueSampleBuffer:newBuffer];
+                if (g_previewLayer.readyForMoreMediaData) {
+                    [g_previewLayer flush];
+                    [g_previewLayer enqueueSampleBuffer:newBuffer];
                 }
                 CFRelease(newBuffer);
             }
@@ -209,8 +257,15 @@ CALayer *g_maskLayer = nil;
 %end
 
 %hook AVCaptureSession
-- (void)startRunning { g_cameraRunning = YES; g_bufferReload = YES; %orig; }
-- (void)stopRunning { g_cameraRunning = NO; %orig; }
+- (void)startRunning {
+    g_cameraRunning = YES; 
+    g_bufferReload = YES; 
+    %orig;
+}
+- (void)stopRunning {
+    g_cameraRunning = NO; 
+    %orig;
+}
 %end
 
 %hook AVCaptureVideoDataOutput
@@ -231,7 +286,7 @@ CALayer *g_maskLayer = nil;
                 }
                 original_method(self, @selector(captureOutput:didOutputSampleBuffer:fromConnection:), output, newBuffer ?: sampleBuffer, connection);
                 if (newBuffer && newBuffer != sampleBuffer) {
-                    CFRelease(newBuffer); // 释放 +1 的引用
+                    CFRelease(newBuffer);
                 }
             } @catch (NSException *e) {
                 original_method(self, @selector(captureOutput:didOutputSampleBuffer:fromConnection:), output, sampleBuffer, connection);
@@ -242,7 +297,7 @@ CALayer *g_maskLayer = nil;
 }
 %end
 
-// 修复拍照重复Hook导致崩溃的问题
+// ============ 拍照防崩溃 Hook ============
 static NSMutableSet *g_hookedPhotoClasses = nil;
 %hook AVCapturePhotoOutput
 - (void)capturePhotoWithSettings:(AVCapturePhotoSettings *)settings delegate:(id<AVCapturePhotoCaptureDelegate>)delegate {
@@ -256,7 +311,6 @@ static NSMutableSet *g_hookedPhotoClasses = nil;
                 __block void (*orig_m)(id, SEL, AVCapturePhotoOutput *, AVCapturePhoto *, NSError *) = nil;
                 MSHookMessageEx([delegate class], @selector(captureOutput:didFinishProcessingPhoto:error:), imp_implementationWithBlock(^(id self, AVCapturePhotoOutput *captureOutput, AVCapturePhoto *photo, NSError *error) {
                     if (![g_fileManager fileExistsAtPath:g_tempFile]) return orig_m(self, @selector(captureOutput:didFinishProcessingPhoto:error:), captureOutput, photo, error);
-                    // 此处省略数据替换，直接放行原图防止崩溃
                     return orig_m(self, @selector(captureOutput:didFinishProcessingPhoto:error:), captureOutput, photo, error);
                 }), (IMP*)&orig_m);
             }
@@ -327,6 +381,7 @@ static NSTimer *g_timeTimer = nil;
 
 // ============ 初始化 ============
 %ctor {
+    VCLOG(@"======== VCAM 加载 ========");
     g_tempFile = [NSString stringWithUTF8String:jbroot("/var/mobile/Library/Caches/temp.mov")];
     g_fileManager = [NSFileManager defaultManager];
     g_videoQueue = dispatch_queue_create("com.vcam.video.reader", DISPATCH_QUEUE_SERIAL);
@@ -338,6 +393,7 @@ static NSTimer *g_timeTimer = nil;
 }
 
 %dtor {
+    VCLOG(@"======== VCAM 卸载 ========");
     g_fileManager = nil;
     [VCAMAudioRoute uninstall];
 }
