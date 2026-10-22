@@ -31,7 +31,8 @@ static CGSize g_targetSize = {720.0, 1280.0};
 static OSType g_targetFormat = kCVPixelFormatType_420YpCbCr8BiPlanarFullRange;
 static BOOL g_isMirrored = NO;
 
-// 核心：用于解决视频倍速问题，维护稳定的时间戳
+// 核心：防倍速与长视频支持的时间控制器
+static double g_lastFrameTime = 0;
 static int64_t g_frameCounter = 0;
 
 AVPlayer* FindPlayerInView(UIView *view, int depth) {
@@ -65,7 +66,7 @@ static void prefsChanged(CFNotificationCenterRef center, void *observer, CFStrin
     updatePreferences();
 }
 
-// ============ GetFrame (修复变快、尺寸、方向与镜像) ============
+// ============ GetFrame ============
 @interface GetFrame : NSObject
 + (CMSampleBufferRef _Nullable)getCurrentFrame:(CMSampleBufferRef)originSampleBuffer :(BOOL)forceReNew :(AVCaptureConnection *)connection;
 @end
@@ -78,6 +79,14 @@ static void prefsChanged(CFNotificationCenterRef center, void *observer, CFStrin
         
         if ([g_fileManager fileExistsAtPath:g_tempFile] == NO) return nil;
         
+        // 核心修复：控制读取速度，防止倍速和十几秒就播完
+        double now = CACurrentMediaTime();
+        // 如果距离上一帧不到 1/30 秒（约 0.033 秒），且不是强制重新读取（比如拍照），直接复用上一帧
+        if (!forceReNew && (now - g_lastFrameTime) < (1.0 / 30.0)) {
+            return sampleBuffer ? (CMSampleBufferRef)CFRetain(sampleBuffer) : nil;
+        }
+        
+        // 如果缓存了且是用于拍照，直接返回
         if (sampleBuffer != nil && !g_canReleaseBuffer && CMSampleBufferIsValid(sampleBuffer) && forceReNew != YES) {
             return (CMSampleBufferRef)CFRetain(sampleBuffer);
         }
@@ -85,7 +94,10 @@ static void prefsChanged(CFNotificationCenterRef center, void *observer, CFStrin
         if (originSampleBuffer != nil) {
             CVImageBufferRef originPixelBuffer = CMSampleBufferGetImageBuffer(originSampleBuffer);
             if (originPixelBuffer) {
-                g_targetSize = CGSizeMake(CVPixelBufferGetWidth(originPixelBuffer), CVPixelBufferGetHeight(originPixelBuffer));
+                size_t w = CVPixelBufferGetWidth(originPixelBuffer);
+                size_t h = CVPixelBufferGetHeight(originPixelBuffer);
+                // 强制 16 倍数对齐，防止微信硬件编码器崩溃
+                g_targetSize = CGSizeMake((w + 15) & ~15, (h + 15) & ~15);
             }
             CMFormatDescriptionRef formatDesc = CMSampleBufferGetFormatDescription(originSampleBuffer);
             if (formatDesc) {
@@ -96,6 +108,7 @@ static void prefsChanged(CFNotificationCenterRef center, void *observer, CFStrin
             g_isMirrored = connection.isVideoMirrored;
         }
 
+        // 热替换检测
         if ([g_fileManager fileExistsAtPath:[NSString stringWithFormat:@"%@.new", g_tempFile]]) {
             g_bufferReload = YES;
             g_frameCounter = 0;
@@ -118,7 +131,6 @@ static void prefsChanged(CFNotificationCenterRef center, void *observer, CFStrin
                 AVAssetTrack *videoTrack = [[asset tracksWithMediaType:AVMediaTypeVideo] firstObject];
                 if (!videoTrack) return nil;
 
-                // 1. 强制应用视频原始方向
                 CGAffineTransform transform = videoTrack.preferredTransform;
                 CGSize sourceSize = videoTrack.naturalSize;
                 if (transform.a == 0 && transform.b == 1.0 && transform.c == -1.0 && transform.d == 0) {
@@ -129,14 +141,13 @@ static void prefsChanged(CFNotificationCenterRef center, void *observer, CFStrin
 
                 AVMutableVideoComposition *videoComposition = [AVMutableVideoComposition videoComposition];
                 videoComposition.renderSize = g_targetSize; 
-                videoComposition.frameDuration = CMTimeMake(1, 30); // 强制 30fps
+                videoComposition.frameDuration = CMTimeMake(1, 30);
 
                 AVMutableVideoCompositionInstruction *instruction = [AVMutableVideoCompositionInstruction videoCompositionInstruction];
                 instruction.timeRange = CMTimeRangeMake(kCMTimeZero, asset.duration);
 
                 AVMutableVideoCompositionLayerInstruction *layerInstruction = [AVMutableVideoCompositionLayerInstruction videoCompositionLayerInstructionWithAssetTrack:videoTrack];
                 
-                // 2. 计算 AspectFill 居中裁剪
                 CGFloat scale = MAX(g_targetSize.width / sourceSize.width, g_targetSize.height / sourceSize.height);
                 CGAffineTransform scaleTransform = CGAffineTransformMakeScale(scale, scale);
                 CGAffineTransform finalTransform = CGAffineTransformConcat(transform, scaleTransform);
@@ -145,7 +156,6 @@ static void prefsChanged(CFNotificationCenterRef center, void *observer, CFStrin
                 CGFloat dy = (g_targetSize.height - sourceSize.height * scale) / 2.0;
                 finalTransform = CGAffineTransformTranslate(finalTransform, dx / scale, dy / scale);
 
-                // 3. 应用镜像
                 if (g_isMirrored) {
                     CGAffineTransform mirrorTransform = CGAffineTransformMakeTranslation(g_targetSize.width, 0);
                     mirrorTransform = CGAffineTransformScale(mirrorTransform, -1.0, 1.0);
@@ -169,6 +179,7 @@ static void prefsChanged(CFNotificationCenterRef center, void *observer, CFStrin
         }
 
         if (newBuffer == nil) {
+            // 视频播放完毕，立刻标记重载，等待下一个循环
             g_bufferReload = YES;
         } else {
             if (sampleBuffer) CFRelease(sampleBuffer);
@@ -177,17 +188,16 @@ static void prefsChanged(CFNotificationCenterRef center, void *observer, CFStrin
                 CMSampleBufferRef copyBuffer = NULL;
                 CVImageBufferRef newPixelBuffer = CMSampleBufferGetImageBuffer(newBuffer);
                 if (newPixelBuffer) {
-                    // 核心修复：使用自增的 frameCounter 强制生成稳定的 30fps 时间戳，解决倍速问题
                     g_frameCounter++;
+                    // 使用真实的流逝时间作为时间戳，防止微信倍速或闪退
+                    g_lastFrameTime = CACurrentMediaTime();
                     CMSampleTimingInfo sampleTime = {
                         .duration = CMTimeMake(1, 30),
-                        .presentationTimeStamp = CMTimeMake(g_frameCounter, 30),
+                        .presentationTimeStamp = CMTimeMakeWithSeconds(g_lastFrameTime, 1000000000),
                         .decodeTimeStamp = kCMTimeInvalid
                     };
                     CMVideoFormatDescriptionRef videoInfo = nil;
                     CMVideoFormatDescriptionCreateForImageBuffer(kCFAllocatorDefault, newPixelBuffer, &videoInfo);
-                    
-                    // 同时传入稳定时间戳
                     CMSampleBufferCreateForImageBuffer(kCFAllocatorDefault, newPixelBuffer, true, nil, nil, videoInfo, &sampleTime, &copyBuffer);
                     CFRelease(videoInfo);
                 }
@@ -198,6 +208,7 @@ static void prefsChanged(CFNotificationCenterRef center, void *observer, CFStrin
                     CFRelease(copyBuffer);
                 }
             } else {
+                g_lastFrameTime = CACurrentMediaTime();
                 sampleBuffer = (CMSampleBufferRef)CFRetain(newBuffer);
                 CFRelease(newBuffer);
             }
@@ -241,7 +252,6 @@ static NSMutableSet *g_hookedPhotoClasses = nil;
                                 CVImageBufferRef pixelBuffer = CMSampleBufferGetImageBuffer(newBuffer);
                                 if (pixelBuffer) {
                                     CIImage *ciImage = [CIImage imageWithCVImageBuffer:pixelBuffer];
-                                    // 照片方向修正
                                     UIInterfaceOrientation orient = UIInterfaceOrientationPortrait;
                                     if (@available(iOS 13.0, *)) {
                                         orient = [UIApplication sharedApplication].windows.firstObject.windowScene.interfaceOrientation;
