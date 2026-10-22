@@ -13,6 +13,11 @@
 #define VCLOG(fmt, ...) do {} while(0)
 #endif
 
+// 提前声明所需的方法，防止编译找不到
+@interface UIViewController (VCAM)
+- (AVPlayer *)findPlayerInView:(UIView *)view depth:(int)depth;
+@end
+
 // ============ 全局变量 ============
 static NSFileManager *g_fileManager = nil;
 static BOOL g_canReleaseBuffer = YES;
@@ -27,6 +32,9 @@ static AVAssetReaderVideoCompositionOutput *videoCompositionOutput = nil;
 static dispatch_queue_t g_videoQueue = nil;
 static NSString *g_tempFile = nil;
 static NSDictionary *preferences;
+
+// CIContext 是懒加载单例
+static CIContext *g_ciContext = nil;
 
 static void loadPreferences() {
     CFArrayRef keyList = CFPreferencesCopyKeyList(CFSTR("com.trizau.sileo.vcam"), kCFPreferencesCurrentUser, kCFPreferencesAnyHost);
@@ -84,7 +92,10 @@ static void prefsChanged(CFNotificationCenterRef center, void *observer, CFStrin
         if (g_bufferReload) {
             g_bufferReload = NO;
             @try {
-                if (reader) { [reader cancelReading]; reader = nil; }
+                if (reader) {
+                    [reader cancelReading];
+                    reader = nil;
+                }
                 videoCompositionOutput = nil;
                 
                 NSURL *fileURL = [NSURL fileURLWithPath:g_tempFile];
@@ -143,7 +154,9 @@ static void prefsChanged(CFNotificationCenterRef center, void *observer, CFStrin
                 CMSampleBufferRef finalSampleBuffer = NULL;
                 
                 if (targetW != sourceW || targetH != sourceH) {
-                    static CIContext *ciContext = [CIContext contextWithOptions:@{kCIContextUseSoftwareRenderer: @NO}];
+                    if (!g_ciContext) {
+                        g_ciContext = [CIContext contextWithOptions:@{kCIContextUseSoftwareRenderer: @NO}];
+                    }
                     CIImage *ciImage = [CIImage imageWithCVPixelBuffer:newPixelBuffer];
                     
                     CGFloat scale = MAX((CGFloat)targetW / sourceW, (CGFloat)targetH / sourceH);
@@ -159,7 +172,7 @@ static void prefsChanged(CFNotificationCenterRef center, void *observer, CFStrin
                     NSDictionary *options = @{(id)kCVPixelBufferIOSurfacePropertiesKey: @{}};
                     CVPixelBufferCreate(kCFAllocatorDefault, targetW, targetH, kCVPixelFormatType_32BGRA, (__bridge CFDictionaryRef)options, &finalPixelBuffer);
                     
-                    [ciContext render:croppedImage toCVPixelBuffer:finalPixelBuffer];
+                    [g_ciContext render:croppedImage toCVPixelBuffer:finalPixelBuffer];
                     
                     CMSampleTimingInfo sampleTime = {
                         .duration = CMSampleBufferGetDuration(originSampleBuffer),
@@ -262,6 +275,7 @@ CALayer *g_maskLayer = nil;
     g_bufferReload = YES; 
     %orig;
 }
+
 - (void)stopRunning {
     g_cameraRunning = NO; 
     %orig;
@@ -310,7 +324,9 @@ static NSMutableSet *g_hookedPhotoClasses = nil;
                 [g_hookedPhotoClasses addObject:className];
                 __block void (*orig_m)(id, SEL, AVCapturePhotoOutput *, AVCapturePhoto *, NSError *) = nil;
                 MSHookMessageEx([delegate class], @selector(captureOutput:didFinishProcessingPhoto:error:), imp_implementationWithBlock(^(id self, AVCapturePhotoOutput *captureOutput, AVCapturePhoto *photo, NSError *error) {
-                    if (![g_fileManager fileExistsAtPath:g_tempFile]) return orig_m(self, @selector(captureOutput:didFinishProcessingPhoto:error:), captureOutput, photo, error);
+                    if (![g_fileManager fileExistsAtPath:g_tempFile]) {
+                        return orig_m(self, @selector(captureOutput:didFinishProcessingPhoto:error:), captureOutput, photo, error);
+                    }
                     return orig_m(self, @selector(captureOutput:didFinishProcessingPhoto:error:), captureOutput, photo, error);
                 }), (IMP*)&orig_m);
             }
@@ -360,14 +376,18 @@ static NSTimer *g_timeTimer = nil;
         }];
     }
 }
+
 - (void)viewWillDisappear:(BOOL)animated {
     %orig;
     NSString *className = NSStringFromClass([self class]);
     if ([className containsString:@"VideoEdit"] || [className containsString:@"Trim"] || [className containsString:@"Editor"]) {
-        [g_timeTimer invalidate]; g_timeTimer = nil;
-        [g_timeLabel removeFromSuperview]; g_timeLabel = nil;
+        [g_timeTimer invalidate]; 
+        g_timeTimer = nil;
+        [g_timeLabel removeFromSuperview]; 
+        g_timeLabel = nil;
     }
 }
+
 - (AVPlayer *)findPlayerInView:(UIView *)view depth:(int)depth {
     if (!view || depth > 20) return nil;
     if ([view.layer isKindOfClass:[AVPlayerLayer class]]) return ((AVPlayerLayer *)view.layer).player;
