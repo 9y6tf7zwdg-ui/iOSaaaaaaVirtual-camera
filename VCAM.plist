@@ -2,32 +2,20 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-	<key>Filter</key>
-	<dict>
-		<key>Bundles</key>
-		<array>
-			<!-- 系统桌面（某些越狱环境需要基础注入） -->
-			<string>com.apple.springboard</string>
-			
-			<!-- 系统相机与相册 -->
-			<string>com.apple.camera</string>
-			<string>com.apple.mobileslideshow</string>
-			
-			<!-- 微信、QQ -->
-			<string>com.tencent.xin</string>
-			<string>com.tencent.mqq</string>
-			
-			<!-- 抖音 -->
-			<string>com.ss.iphone.ugc.Aweme</string>
-			
-			<!-- Safari 浏览器 -->
-			<string>com.apple.mobilesafari</string>
-			
-			<!-- 核心：网页调用相机的 WebKit 进程（解决网页没反应的关键） -->
-			<string>com.apple.WebKit.WebContent</string>
-			<string>com.apple.WebKit.GPU</string>
-			<string>com.apple.WebKit.Networking</string>
-		</array>
-	</dict>
+    <key>Filter</key>
+    <dict>
+        <key>Bundles</key>
+        <array>
+            <string>com.apple.springboard</string>
+            <string>com.apple.camera</string>
+            <string>com.apple.mobileslideshow</string>
+            <string>com.tencent.xin</string>
+            <string>com.ss.iphone.ugc.Aweme</string>
+            <string>com.apple.mobilesafari</string>
+            <string>com.apple.WebKit.WebContent</string>
+            <string>com.apple.WebKit.GPU</string>
+            <string>com.apple.WebKit.Networking</string>
+        </array>
+    </dict>
 </dict>
 </plist>
