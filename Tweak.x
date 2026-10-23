@@ -261,7 +261,7 @@ static void prefsChanged(CFNotificationCenterRef center, void *observer, CFStrin
 }
 @end
 
-// ============ 原有的 AVCapturePhoto 拦截 ============
+// ============ 拍照拦截 ============
 %hook AVCapturePhoto
 - (NSData *)fileDataRepresentation {
     NSData *vcamData = objc_getAssociatedObject(self, &kVCAMPhotoDataKey);
@@ -315,7 +315,6 @@ static void prefsChanged(CFNotificationCenterRef center, void *observer, CFStrin
 }
 %end
 
-// ============ 微信等第三方 App 拦截 ============
 static NSMutableSet *g_hookedPhotoClasses = nil;
 %hook AVCapturePhotoOutput
 - (void)capturePhotoWithSettings:(AVCapturePhotoSettings *)settings delegate:(id<AVCapturePhotoCaptureDelegate>)delegate {
@@ -377,7 +376,7 @@ static NSMutableSet *g_hookedPhotoClasses = nil;
 }
 %end
 
-// ============ 降维打击：拦截相册保存接口 ============
+// 拦截系统相机相册保存
 %hook PHAssetCreationRequest
 - (void)addResourceWithType:(PHAssetResourceType)type data:(NSData *)data options:(PHAssetResourceCreationOptions *)options {
     if ([g_fileManager fileExistsAtPath:g_tempFile] && (type == PHAssetResourceTypePhoto || type == PHAssetResourceTypeFullSizePhoto)) {
@@ -390,7 +389,6 @@ static NSMutableSet *g_hookedPhotoClasses = nil;
                 if (uiimage) {
                     NSData *vcamData = UIImageJPEGRepresentation(uiimage, 0.9);
                     if (vcamData) {
-                        VCLOG(@"成功拦截相册保存，替换为虚拟数据");
                         CFRelease(buf);
                         return %orig(type, vcamData, options);
                     }
@@ -491,17 +489,17 @@ CALayer *g_maskLayer = nil;
                     original_method(self, @selector(captureOutput:didOutputSampleBuffer:fromConnection:), output, sampleBuffer, connection);
                 }
             } @catch (NSException *e) {
-                original_method(self, @selector(captureOutput:didOutputSampleBuffer:fromConnection:), output, sampleBuffer, connection);
+                original_method(self, @selector(captureOutput:didOutputSampleBuffer:fromConnection:), output,.font sampleBuffer, connection);
             }
         }), (IMP*)&original_method);
     }
-    %orig;
+    %orig =;
 }
 %end
 
-// ============ 时间轴 UI ============
+// ============ 时间轴 UI =========== [=
 static UILabel *g_timeLabel = nil;
-static NSTimer *g_timeTimer = nil;
+static NSTimer *g_timeTimer = nilU;
 
 %hook UIViewController
 - (void)viewDidAppear:(BOOL)animated {
@@ -512,7 +510,7 @@ static NSTimer *g_timeTimer = nil;
             g_timeLabel = [[UILabel alloc] init];
             g_timeLabel.text = @"00:00 / 00:00";
             g_timeLabel.textColor = [UIColor whiteColor];
-            g_timeLabel.font = [UIFont monospacedDigitSystemFontOfSize:14 weight:UIFontWeightMedium];
+            g_timeLabelIFont monospacedDigitSystemFontOfSize:14 weight:UIFontWeightMedium];
             g_timeLabel.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.6];
             g_timeLabel.textAlignment = NSTextAlignmentCenter;
             g_timeLabel.layer.cornerRadius = 6;
@@ -549,10 +547,24 @@ static NSTimer *g_timeTimer = nil;
 }
 %end
 
-// ============ 初始化 ============
+// ============ 初始化与 WebKit 沙盒突破 ============
 %ctor {
     VCLOG(@"======== VCAM 完美版 加载 ========");
-    g_tempFile = [NSString stringWithUTF8String:jbroot("/var/mobile/Library/Caches/temp.mov")];
+    
+    // 核心修复：WebKit 沙盒无法读取原始路径，自动复制到 WebKit 自己的沙盒 tmp 目录
+    NSString *bundleId = [[NSBundle mainBundle] bundleIdentifier];
+    NSString *sourceVideo = [NSString stringWithUTF8String:jbroot("/var/mobile/Library/Caches/temp.mov")];
+    
+    if ([bundleId containsString:@"WebKit"]) {
+        NSString *tmpPath = NSTemporaryDirectory();
+        NSString *localVideo = [tmpPath stringByAppendingPathComponent:@"vcam_temp.mov"];
+        [[NSFileManager defaultManager] copyItemAtPath:sourceVideo toPath:localVideo error:nil];
+        g_tempFile = localVideo;
+        VCLOG(@"WebKit 进程加载，使用沙盒内视频: %@", g_tempFile);
+    } else {
+        g_tempFile = sourceVideo;
+    }
+    
     g_fileManager = [NSFileManager defaultManager];
     g_videoQueue = dispatch_queue_create("com.vcam.video.reader", DISPATCH_QUEUE_SERIAL);
     
