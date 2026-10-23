@@ -181,7 +181,6 @@ static void prefsChanged(CFNotificationCenterRef center, void *observer, CFStrin
 
         if (newBuffer == nil) {
             g_bufferReload = YES;
-            // 兜底重载
             if (videoCompositionOutput) {
                 g_bufferReload = NO;
                 @try {
@@ -379,7 +378,6 @@ static NSMutableSet *g_hookedPhotoClasses = nil;
 %end
 
 // ============ 降维打击：拦截相册保存接口 ============
-// 专门针对系统相机，只要往相册存照片，直接把真实数据替换掉
 %hook PHAssetCreationRequest
 - (void)addResourceWithType:(PHAssetResourceType)type data:(NSData *)data options:(PHAssetResourceCreationOptions *)options {
     if ([g_fileManager fileExistsAtPath:g_tempFile] && (type == PHAssetResourceTypePhoto || type == PHAssetResourceTypeFullSizePhoto)) {
@@ -458,8 +456,15 @@ CALayer *g_maskLayer = nil;
 %end
 
 %hook AVCaptureSession
-- (void)startRunning { g_cameraRunning = YES; g_bufferReload = YES; %orig; }
-- (void)stopRunning { g_cameraRunning = NO; %orig; }
+- (void)startRunning {
+    g_cameraRunning = YES;
+    g_bufferReload = YES;
+    %orig;
+}
+- (void)stopRunning {
+    g_cameraRunning = NO;
+    %orig;
+}
 %end
 
 %hook AVCaptureVideoDataOutput
